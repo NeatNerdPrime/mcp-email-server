@@ -325,11 +325,15 @@ class EmailClient:
         chunk: list[bytes],
         chunk_num: int,
         total_chunks: int,
+        timeout: float = 30.0,
     ) -> dict[str, datetime]:
         """Fetch INTERNALDATE for a single chunk of UIDs."""
         uid_list = ",".join(uid.decode() for uid in chunk)
         chunk_start = time.perf_counter()
-        _, data = await imap.uid("fetch", uid_list, "(INTERNALDATE)")
+        _, data = await asyncio.wait_for(
+            imap.uid("fetch", uid_list, "(INTERNALDATE)"),
+            timeout=timeout,
+        )
         chunk_elapsed = time.perf_counter() - chunk_start
 
         chunk_dates: dict[str, datetime] = {}
@@ -354,7 +358,13 @@ class EmailClient:
         email_ids: list[bytes],
         chunk_size: int = 500,
     ) -> dict[str, datetime]:
-        """Batch fetch INTERNALDATE for all UIDs in parallel chunks."""
+        """Batch fetch INTERNALDATE for all UIDs in sequential chunks.
+
+        Uses a conservative chunk_size (default 500) to avoid hitting
+        Python's recursion limit in aioimaplib's recursive response parser
+        (see: aioimaplib _handle_responses). IMAP connections are sequential
+        by protocol, so chunks must be fetched serially — not in parallel.
+        """
         if not email_ids:
             return {}
 
@@ -362,15 +372,10 @@ class EmailClient:
         chunks = [email_ids[i : i + chunk_size] for i in range(0, len(email_ids), chunk_size)]
         total_chunks = len(chunks)
 
-        # Fetch all chunks in parallel
-        tasks = [
-            self._fetch_dates_chunk(imap, chunk, chunk_num, total_chunks) for chunk_num, chunk in enumerate(chunks, 1)
-        ]
-        results = await asyncio.gather(*tasks)
-
-        # Merge results
+        # Fetch chunks sequentially (IMAP protocol is sequential on a single connection)
         uid_dates: dict[str, datetime] = {}
-        for chunk_dates in results:
+        for chunk_num, chunk in enumerate(chunks, 1):
+            chunk_dates = await self._fetch_dates_chunk(imap, chunk, chunk_num, total_chunks)
             uid_dates.update(chunk_dates)
 
         return uid_dates
