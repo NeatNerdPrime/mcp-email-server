@@ -67,12 +67,12 @@ _, data = await asyncio.wait_for(
 
 ## Verification
 
-| Metric | Before | After |
-|--------|--------|-------|
-| >1000 messages | RecursionError / hang | Completes normally |
-| Chunks | 1 (all UIDs) | N x 500 |
-| Test suite | 140 passed | 142 passed (+2 regression tests) |
-| `make check` | clean | clean |
+| Metric         | Before                | After                            |
+| -------------- | --------------------- | -------------------------------- |
+| >1000 messages | RecursionError / hang | Completes normally               |
+| Chunks         | 1 (all UIDs)          | N x 500                          |
+| Test suite     | 140 passed            | 142 passed (+2 regression tests) |
+| `make check`   | clean                 | clean                            |
 
 Validated in production on a mailbox with >4,000 messages: completes in
 under 1 second across 9 sequential chunks.
