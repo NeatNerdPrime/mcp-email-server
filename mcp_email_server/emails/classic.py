@@ -511,7 +511,7 @@ class EmailClient:
             email_ids = messages[0].split()
             logger.info(f"Found {len(email_ids)} email IDs")
 
-            # Phase 1: Batch fetch INTERNALDATE for sorting (parallel chunks)
+            # Phase 1: Batch fetch INTERNALDATE for sorting (sequential chunks)
             fetch_dates_start = time.perf_counter()
             uid_dates = await self._batch_fetch_dates(imap, email_ids)
             fetch_dates_elapsed = time.perf_counter() - fetch_dates_start

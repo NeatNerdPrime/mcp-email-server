@@ -675,7 +675,7 @@ class TestBatchFetchDates:
         with >1000 responses in a single buffer, this exceeds Python's default
         recursion limit and causes a RecursionError / infinite hang.
 
-        See: https://github.com/ai-zerolab/mcp-email-server/issues/XXX
+        See: https://github.com/ai-zerolab/mcp-email-server/pull/155
         """
         # Simulate a mailbox with 1500 UIDs — must result in multiple chunks
         num_uids = 1500
