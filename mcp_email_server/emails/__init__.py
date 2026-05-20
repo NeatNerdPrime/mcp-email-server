@@ -7,6 +7,7 @@ if TYPE_CHECKING:
         AttachmentDownloadResponse,
         EmailContentBatchResponse,
         EmailMetadataPageResponse,
+        MailboxInfo,
     )
 
 
@@ -83,6 +84,32 @@ class EmailHandler(abc.ABC):
     async def delete_emails(self, email_ids: list[str], mailbox: str = "INBOX") -> tuple[list[str], list[str]]:
         """
         Delete emails by their IDs. Returns (deleted_ids, failed_ids)
+        """
+
+    @abc.abstractmethod
+    async def move_emails(
+        self, email_ids: list[str], source_mailbox: str, destination_mailbox: str
+    ) -> tuple[list[str], list[str]]:
+        """
+        Move emails between mailboxes. Returns (moved_ids, failed_ids)
+
+        Args:
+            email_ids: List of email UIDs to move.
+            source_mailbox: The mailbox to move emails from.
+            destination_mailbox: The mailbox to move emails to.
+        """
+
+    @abc.abstractmethod
+    async def list_mailboxes(self, pattern: str = "*", reference: str = "") -> list["MailboxInfo"]:
+        """
+        List available mailboxes/folders in the account.
+
+        Args:
+            pattern: IMAP LIST pattern (e.g., "*" for all, "INBOX.*" for INBOX children).
+            reference: IMAP LIST reference name (namespace prefix).
+
+        Returns:
+            List of MailboxInfo with name, delimiter, and flags.
         """
 
     @abc.abstractmethod
