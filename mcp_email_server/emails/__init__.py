@@ -127,6 +127,16 @@ class EmailHandler(abc.ABC):
         """
 
     @abc.abstractmethod
+    async def archive_emails(self, email_ids: list[str], mailbox: str = "INBOX") -> tuple[list[str], list[str], str]:
+        """
+        Move emails to the account's Archive folder (auto-detected). Returns (moved_ids, failed_ids, archive_folder).
+
+        Args:
+            email_ids: List of email UIDs to archive.
+            mailbox: The source mailbox (default: "INBOX").
+        """
+
+    @abc.abstractmethod
     async def list_mailboxes(self, pattern: str = "*", reference: str = "") -> list["MailboxInfo"]:
         """
         List available mailboxes/folders in the account.

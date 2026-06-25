@@ -413,6 +413,28 @@ async def move_emails(
 
 
 @mcp.tool(
+    description="Archive one or more emails by moving them to the account's Archive folder, "
+    "auto-detected via the RFC 6154 \\Archive flag (falling back to common names like Archive or "
+    "[Gmail]/All Mail). Use list_emails_metadata first to get the email_id."
+)
+async def archive_emails(
+    account_name: Annotated[str, Field(description="The name of the email account.")],
+    email_ids: Annotated[
+        list[str],
+        Field(description="List of email_id to archive (obtained from list_emails_metadata)."),
+    ],
+    mailbox: Annotated[str, Field(default="INBOX", description="The source mailbox containing the emails.")] = "INBOX",
+) -> str:
+    handler = dispatch_handler(account_name)
+    archived_ids, failed_ids, archive_folder = await handler.archive_emails(email_ids, mailbox)
+
+    result = f"Successfully archived {len(archived_ids)} email(s) to {archive_folder}"
+    if failed_ids:
+        result += f", failed to archive {len(failed_ids)} email(s): {', '.join(failed_ids)}"
+    return result
+
+
+@mcp.tool(
     description="List available mailboxes/folders for an email account. Returns folder names, hierarchy delimiters, and flags. Useful for discovering folder names before moving emails."
 )
 async def list_mailboxes(

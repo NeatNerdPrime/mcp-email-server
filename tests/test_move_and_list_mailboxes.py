@@ -652,6 +652,79 @@ class TestClassicHandlerMoveEmails:
         mock_move.assert_called_once_with(["300"], "Trash", "INBOX")
 
 
+class TestClassicHandlerArchiveEmails:
+    """Tests for ClassicEmailHandler.archive_emails (Archive-folder detection + move)."""
+
+    @pytest.mark.asyncio
+    async def test_archive_uses_rfc6154_flag(self, classic_handler):
+        """The Archive folder is detected via the RFC 6154 \\Archive flag."""
+        mailboxes = [
+            MailboxInfo(name="INBOX", delimiter="/", flags=["\\HasNoChildren"]),
+            MailboxInfo(name="All Mail", delimiter="/", flags=["\\Archive", "\\HasNoChildren"]),
+        ]
+        mock_list = AsyncMock(return_value=mailboxes)
+        mock_move = AsyncMock(return_value=(["100"], []))
+
+        with patch.object(classic_handler.incoming_client, "list_mailboxes", mock_list):
+            with patch.object(classic_handler.incoming_client, "move_emails", mock_move):
+                moved, failed, archive_folder = await classic_handler.archive_emails(["100"], "INBOX")
+
+        assert moved == ["100"]
+        assert failed == []
+        assert archive_folder == "All Mail"
+        mock_move.assert_called_once_with(["100"], "INBOX", "All Mail")
+
+    @pytest.mark.asyncio
+    async def test_archive_falls_back_to_common_name(self, classic_handler):
+        """Without an \\Archive flag, fall back to a common folder name."""
+        mailboxes = [
+            MailboxInfo(name="INBOX", delimiter="/", flags=[]),
+            MailboxInfo(name="Archive", delimiter="/", flags=["\\HasNoChildren"]),
+        ]
+        mock_list = AsyncMock(return_value=mailboxes)
+        mock_move = AsyncMock(return_value=(["100", "200"], []))
+
+        with patch.object(classic_handler.incoming_client, "list_mailboxes", mock_list):
+            with patch.object(classic_handler.incoming_client, "move_emails", mock_move):
+                moved, _failed, archive_folder = await classic_handler.archive_emails(["100", "200"])
+
+        assert moved == ["100", "200"]
+        assert archive_folder == "Archive"
+        mock_move.assert_called_once_with(["100", "200"], "INBOX", "Archive")
+
+    @pytest.mark.asyncio
+    async def test_archive_fallback_preserves_server_mailbox_case(self, classic_handler):
+        """Common folder-name fallback is case-insensitive but preserves the server's actual mailbox name."""
+        mailboxes = [
+            MailboxInfo(name="INBOX", delimiter="/", flags=[]),
+            MailboxInfo(name="archive", delimiter="/", flags=[]),
+        ]
+        mock_list = AsyncMock(return_value=mailboxes)
+        mock_move = AsyncMock(return_value=(["100"], []))
+
+        with patch.object(classic_handler.incoming_client, "list_mailboxes", mock_list):
+            with patch.object(classic_handler.incoming_client, "move_emails", mock_move):
+                moved, failed, archive_folder = await classic_handler.archive_emails(["100"])
+
+        assert moved == ["100"]
+        assert failed == []
+        assert archive_folder == "archive"
+        mock_move.assert_called_once_with(["100"], "INBOX", "archive")
+
+    @pytest.mark.asyncio
+    async def test_archive_raises_when_no_archive_folder(self, classic_handler):
+        """A ValueError is raised when no Archive folder can be found."""
+        mock_list = AsyncMock(return_value=[MailboxInfo(name="INBOX", delimiter="/", flags=[])])
+        mock_move = AsyncMock()
+
+        with patch.object(classic_handler.incoming_client, "list_mailboxes", mock_list):
+            with patch.object(classic_handler.incoming_client, "move_emails", mock_move):
+                with pytest.raises(ValueError, match="No Archive folder found"):
+                    await classic_handler.archive_emails(["100"])
+
+        mock_move.assert_not_called()
+
+
 class TestClassicHandlerListMailboxes:
     """Tests for ClassicEmailHandler.list_mailboxes delegation."""
 
