@@ -10,6 +10,7 @@ from mcp_email_server.config import (
     AccountAttributes,
     EmailSettings,
     ProviderSettings,
+    clear_settings_cache,
     get_settings,
     normalize_address,
 )
@@ -103,8 +104,18 @@ async def list_available_accounts() -> list[AccountAttributes]:
 @mcp.tool(description="Add a new email account configuration to the settings.")
 async def add_email_account(email: EmailSettings) -> str:
     settings = get_settings()
-    settings.add_email(email)
-    settings.store()
+    try:
+        settings.add_email(email)
+        settings.store()
+    except Exception:
+        # add_email() reassigns settings.emails, and pydantic's validate_assignment
+        # applies the new value BEFORE running the check_unique_account_names
+        # after-validator — so even a rejected duplicate-name add leaves the cached
+        # instance mutated. store() can also mutate-then-fail (e.g. a locked
+        # keychain in explicit keyring mode). Either way, discard the cache so later
+        # tool calls don't see a phantom/corrupted account that isn't actually on disk.
+        clear_settings_cache()
+        raise
     return f"Successfully added email account '{email.account_name}'"
 
 
