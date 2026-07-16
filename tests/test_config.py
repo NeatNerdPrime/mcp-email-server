@@ -160,6 +160,19 @@ def test_password_is_secret_type():
     assert server.password.get_secret_value() == "s3cret"
 
 
+def test_email_settings_init_validates_password_type():
+    """EmailSettings.init must preserve Pydantic validation of raw passwords."""
+    with pytest.raises(ValidationError, match="password"):
+        EmailSettings.init(
+            account_name="test",
+            full_name="Test User",
+            email_address="test@example.com",
+            user_name="test@example.com",
+            password=123,  # type: ignore[arg-type]
+            imap_host="imap.example.com",
+        )
+
+
 def test_api_key_is_secret_type():
     """API key field must be SecretStr."""
     provider = ProviderSettings(
@@ -312,6 +325,24 @@ def test_get_account_and_get_accounts():
     masked_accounts = settings.get_accounts(masked=True)
     provider_masked = next(a for a in masked_accounts if a.account_name == "lookup_provider")
     assert provider_masked.api_key.get_secret_value() == "********"
+
+
+def test_store_accepts_string_toml_file(tmp_path, monkeypatch):
+    settings = Settings()
+    config_path = tmp_path / "config.toml"
+    monkeypatch.setitem(Settings.model_config, "toml_file", str(config_path))
+
+    settings.store()
+
+    assert config_path.exists()
+
+
+def test_store_rejects_invalid_toml_file_setting(monkeypatch):
+    settings = Settings()
+    monkeypatch.setitem(Settings.model_config, "toml_file", None)
+
+    with pytest.raises(TypeError, match="toml_file must identify exactly one file"):
+        settings.store()
 
 
 def test_store_settings_defaults_to_cached_instance(tmp_path, monkeypatch):
