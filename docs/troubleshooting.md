@@ -1,5 +1,9 @@
 # Troubleshooting
 
+> **Version scope:** Managed mode and the embedded React UI on this page are
+> Local Email App V2 behavior. See [Version availability](getting-started.md#version-availability)
+> before using these commands with a PyPI installation.
+
 Start by running the relevant command with a visible terminal so server logs and
 keyring prompts are not hidden by the MCP client.
 
@@ -35,8 +39,9 @@ MCP_EMAIL_SERVER_PASSWORD
 MCP_EMAIL_SERVER_IMAP_HOST
 ```
 
-The generic password remains required even when
-`MCP_EMAIL_SERVER_IMAP_PASSWORD` is set. Invalid integer ports or invalid
+The generic password must be non-empty and remains required even when
+`MCP_EMAIL_SERVER_IMAP_PASSWORD` is set. An absent or empty IMAP/SMTP-specific
+password falls back to the generic password. Invalid integer ports or invalid
 account fields cause the environment account to be skipped and an error to be
 logged.
 
@@ -46,14 +51,17 @@ than merging individual fields.
 
 ## A different configuration file is loaded
 
-The default file is:
+The default legacy source and derived bootstrap authority are:
 
 ```text
 ~/.config/mcp-email-server/config.toml
+~/.config/mcp-email-server/config.bootstrap.toml
 ```
 
-`MCP_EMAIL_SERVER_CONFIG_PATH` selects another path. The path is resolved when
-the configuration module is imported, so restart the server after changing it.
+`MCP_EMAIL_SERVER_CONFIG_PATH` selects another legacy source path; the bootstrap
+sidecar is its sibling with `.bootstrap` inserted before the TOML suffix. The
+path is resolved when the configuration module is imported, so restart the server
+after changing it. Selection and reviewed import do not rewrite the source file.
 
 On first use, the server can copy a legacy file from:
 
@@ -63,26 +71,203 @@ On first use, the server can copy a legacy file from:
 
 Check server logs for the resolved path.
 
-## The UI cannot load accounts
+## Managed mode does not start
 
-If the UI displays a keyring error, the TOML file probably contains
-`__KEYRING__` markers whose secrets cannot currently be read. Unlock or restore
-the operating system keyring, approve any pending Keychain prompt, or migrate
-the credentials to plaintext after keyring access is restored:
+Run bounded diagnostics from a terminal:
 
 ```bash
-mcp-email-server migrate-credentials --to plaintext
+mcp-email-server config status
+mcp-email-server config doctor
+# For agent/user automation:
+mcp-email-server config status --json
+mcp-email-server config doctor --json
 ```
 
-If the stored configuration is no longer recoverable, reset it and re-add the
-accounts:
+The low-level agent management API uses `schema_version: 1`. JSON callers should
+branch on `schema_version`, `ok`, `command`, typed `error.code`, and stable data
+rather than matching fixed safe message prose. JSON output grants no authority to
+run another command. Managed startup requires all of the following:
+
+- a parseable owner-only bootstrap sidecar with `bootstrap_version = 1`,
+  `managed_selection = true`, `mode = "managed"`, and
+  `managed_db_location`;
+- a present, regular, non-symlink SQLite file in an owner-only immediate parent;
+- the exact supported managed schema.
+
+The server deliberately does not fall back to TOML accounts when a bootstrap or
+catalog check fails. An incomplete enabled account is omitted individually and
+reported by `config doctor`; it does not block other complete accounts. Active
+credentials are resolved only immediately before constructing that account's
+provider, from the owner-only managed SQLite secret store on Linux or the same
+system-keyring session on a supported non-Linux platform. An unreadable secret
+therefore fails that account operation and is reported by `config doctor`, rather
+than blocking unrelated complete accounts at startup. `config status` still
+returns bounded bootstrap state and
+`catalog_status=unavailable` when the selected database is missing, corrupt,
+incompatible, or insecure. A fresh installation reports
+`catalog_status=not_configured`; an agent must hand setup back to the user rather
+than collecting credentials. In an unavailable state, deliberately run `mcp-email-server
+config select legacy` and restart; this recovery transition uses a revisioned
+bootstrap compare-and-swap and does not open the failed catalog. If the bootstrap
+sidecar itself is unparseable, repair or restore that sidecar manually; `reset`
+cannot safely infer its mode and therefore does not unlink the independent legacy
+source.
+
+There are no released managed-catalog users for this pre-release redesign, so
+older development catalog schemas are rejected rather than migrated. While
+legacy mode is selected, preserve the old file for rollback and initialize a
+fresh owner-only path with `mcp-email-server config init --database NEW_PATH`.
+Then re-enter accounts or use the reviewed legacy import flow. Fresh setup
+selects managed immediately; an existing v1 source remains selected until a
+complete import succeeds. Remove the obsolete development catalog only after verifying the
+replacement; on Linux, treat every old catalog copy as secret-bearing.
+
+If a managed password save fails, correct the reported storage or revision
+problem and submit a new value with:
 
 ```bash
-mcp-email-server reset
+mcp-email-server account set-secret ACCOUNT incoming
 ```
 
-`reset` removes all persistently configured accounts and performs best-effort
-keyring cleanup.
+Use `outgoing` for an SMTP credential. A failed save leaves no intermediate
+binding and does not change the current binding authority. On Linux, secret
+insertion and active binding/revision commit in one managed SQLite transaction.
+On supported POSIX non-Linux platforms, restore system-keyring access before retrying.
+Provider connectivity is diagnosed with `mcp-email-server account test ACCOUNT
+incoming|outgoing [--json]`; this agent-facing low-level CLI diagnostic has no
+Web UI route or Test connection action. Connectivity checks report only bounded
+categories: `timeout`, `endpoint_unavailable`, `credential_unavailable`,
+`authentication_or_provider_rejected`, or `tls_or_connection_failed`. Follow the
+safe remediation message; raw provider exceptions are intentionally hidden.
+
+`CLEANUP_REQUIRED` means a replacement or detachment committed but an old value
+could not be deleted. Restore access to the selected managed secret store and
+run:
+
+```bash
+mcp-email-server config cleanup-credentials --limit 100
+```
+
+Cleanup handles only superseded cleanup-required rows and never removes an active
+credential. The account remains usable after a rotation cleanup failure; a
+credential detachment instead leaves the disabled account incomplete until a new
+secret is installed.
+
+## A managed write reports a revision conflict
+
+Run `mcp-email-server account show ACCOUNT` and use its current `revision` with
+`--expected-revision`. Update, disable, enable, credential removal, and soft
+removal use optimistic revisions so a stale operator command cannot overwrite a
+concurrent lifecycle or endpoint change. Do not blindly retry: inspect the new
+state first, then issue the intended command against that revision.
+
+To remove an account, the confirmation must also exactly match the current name:
+
+```bash
+mcp-email-server account remove work \
+  --expected-revision 7 \
+  --confirm work
+```
+
+The operation is a soft removal. Its normalized-name tombstone permanently
+reserves that name in this delivery; it cannot be reused.
+
+## Metadata index warnings or `query_too_broad`
+
+In legacy mode, an owner, permission, symlink, busy, corrupt, or unsupported
+schema problem at `db_location` disables only the rebuildable metadata index.
+The application logs a bounded warning and runs the same request through IMAP;
+the MCP handler does not bypass the application query service. Correct the
+parent directory and database to owner-only access, or remove a disposable
+operational database while the server is stopped so it can be rebuilt.
+
+Managed mode is different because the selected database also owns account
+authority and, on Linux, contains plaintext managed values in `managed_secret`.
+A copied or backed-up Linux catalog must retain owner-only protection equivalent
+to the original and must not be shared as a non-secret diagnostic artifact. An
+open, security, corruption, schema, or projection-write failure
+therefore fails closed rather than returning a result or falling back to TOML.
+In legacy mode, a projection write failure after a validated bounded provider
+read may return that provider result with a warning; the next request refreshes
+again.
+
+`query_too_broad` means an IMAP search returned more than 10,000 candidate UIDs,
+so the application could not prove the requested page and exact filtered total
+within its work budget. Narrow the mailbox or add a date, sender, recipient,
+subject, body, text, flag, or attachment filter. Increasing `page_size` cannot
+bypass the limit; `page_size` is restricted to 1 through 100. An `invalid UID
+search results` or incomplete provider-metadata error means the server returned
+a malformed UID set or did not return exact sender/INTERNALDATE evidence for
+every requested UID. The request is rejected rather than expanding a UID range
+or returning an incorrect page; retry after the mailbox is stable or report the
+provider issue.
+
+## The UI cannot load or authenticate
+
+Run `mcp-email-server ui` in a visible terminal and keep that foreground process
+running. Open only the fresh browser link launched by that process. If browser
+launch fails, the command prints the one-time URL to that attached terminal. To
+suppress browser launch deliberately, use `--no-open` in a real TTY; redirected
+or noninteractive stdout/stderr is rejected and never receives the token. A bootstrap
+link is single-use and expires after five minutes; replay, a stale tab after
+restart, `localhost` substitution, a foreign Origin, or a copied URL whose
+fragment was stripped produces the same bounded recovery message. Close the tab
+and launch the command again rather than editing the process route or cookie.
+
+The server accepts only exact `127.0.0.1:<actual-port>` requests. A proxy,
+browser extension, security product, or custom hosts rewrite that changes Host,
+Origin, Fetch Metadata, JSON content type, cookie, or CSRF headers is rejected.
+After authentication, ordinary account work is under **Email accounts**;
+importing earlier settings, sending/attachment safety, and troubleshooting are
+folded under **Settings & help**. Account creation starts with an email address
+and password. The suggested server settings remain editable under the account
+form's connection disclosures, together with login name, port, security,
+certificate, sending, and Sent-folder details. There is no redundant connection
+preview; advanced settings and optional outgoing mail stay folded until needed.
+Provider connectivity testing is CLI-only. Empty-workspace and settled-ready
+banners with no next action are hidden; actionable import, selection, restart,
+or conflict states remain visible. There is no catalog activation step, and a
+saved account is not a provider-connectivity certification.
+There is no supported remote, wildcard, CORS, or shared-link mode. Managed
+catalog/bootstrap operations, attachment writes, and oversized spill require
+the documented POSIX filesystem primitives. An unsupported-platform error is a
+fail-closed boundary, not a permissions setting that can be bypassed.
+
+If **Import existing settings** reports that the managed catalog parent must be
+owner-only, an existing legacy configuration directory grants group or world
+access. Stop every server process, verify that the directory is owned by the
+current user and is dedicated to this application, then restrict that directory
+before retrying. For the default location on POSIX systems:
+
+```bash
+chmod 700 ~/.config/mcp-email-server
+```
+
+Do not apply this command to a shared directory or change ownership/permissions
+without first inspecting the path. The application deliberately does not chmod
+an existing legacy directory on the user's behalf.
+
+If status loads but managed operations fail, run the equivalent bounded CLI
+checks in the same operating-system login session:
+
+```bash
+mcp-email-server config status
+mcp-email-server config doctor
+```
+
+A storage failure prevents credential installation but leaves the current
+binding authority unchanged. On Linux, check managed database access; on a
+supported POSIX non-Linux platform, restore system-keyring access. Return to **Email
+accounts**, open **Password** for the affected account, and submit a new value.
+`CLEANUP_REQUIRED` means the active result is known but an old superseded value
+remains. **Email accounts** shows a bounded password-data cleanup action whenever
+doctor reports such leftovers, including after the last active account was
+removed; you can also use the CLI. Revision conflicts are not
+retried automatically: inspect
+the displayed current summary before resubmitting. If a write succeeds but the
+following account-list refresh fails, the UI hides the older account actions
+instead of reusing stale revisions. Choose **Refresh accounts** before making
+another change.
 
 ## Keychain repeatedly asks for permission
 
@@ -130,20 +315,20 @@ The migration command prints a warning when the values conflict.
 Migration changes only persistent TOML accounts. It does not migrate an
 account supplied solely through environment variables.
 
-## `send_email` is missing
+## `send_email` reports that SMTP is unavailable
 
-`send_email` is advertised only when at least one configured account contains
-an SMTP `outgoing` section or `MCP_EMAIL_SERVER_SMTP_HOST` is set for the
-environment account.
-
-If the tool is visible but sending fails for one account, confirm that the
-selected `account_name` itself has SMTP settings. Visibility is based on all
-accounts, not the selected one.
+`send_email` is always advertised in the static MCP catalog. If sending fails
+for one account, confirm that the selected account is enabled and has a complete
+SMTP endpoint and active outgoing credential. In managed mode, inspect it with
+`account show`; disable it before changing or removing credentials, then
+re-enable it with the latest revision.
 
 ## SMTP delivery succeeds but saving to Sent fails
 
-SMTP delivery and the IMAP append are separate operations. List the provider's
-folders with `list_mailboxes`, then configure the exact folder:
+SMTP delivery and the IMAP append are separate operations. A tagged result can
+therefore show accepted recipients together with `sent-copy: failed` or
+`sent-copy: unknown`. Do not resend the message to repair the copy. List the
+provider's folders with `list_mailboxes`, then configure the exact folder:
 
 ```toml
 [[emails]]
@@ -188,7 +373,10 @@ MCP_EMAIL_SERVER_ENABLE_ATTACHMENT_DOWNLOAD=true
 
 Use an absolute `save_path` when possible and ensure the server process can
 write to its parent directory. A relative path is resolved against the server
-process's working directory.
+process's working directory. The destination fails closed if any existing parent
+is a symlink or not a directory, or if the final target is a symlink, FIFO,
+device, or other non-regular file. Choose a real directory and an exact regular
+file path; do not work around this check with links.
 
 ## A message mutation reports success but nothing changed
 
@@ -213,6 +401,29 @@ mutation tool.
 Call `list_mailboxes` to discover the actual folder and use `move_emails` with
 an explicit destination when the provider uses another name.
 
+## Delete or move reports failures on an older IMAP server
+
+Message-scoped delete requires IMAP `UIDPLUS` and uses target-scoped
+`UID EXPUNGE`. It deliberately never falls back to mailbox-wide `EXPUNGE`,
+because that could remove unrelated messages already marked `\Deleted` by
+another client.
+
+When a server lacks both native `MOVE` and `UIDPLUS`, `move_emails` also rejects
+the COPY-and-delete fallback before copying. Use the provider's native client or
+upgrade/configure the server to support `MOVE` or `UIDPLUS`.
+
+## A mutation result contains `unknown` or `reconciliation needed`
+
+`unknown` means the remote effect may have started but the connection did not
+return authoritative completion evidence. The server deliberately does not
+retry. Inspect the target mailbox, flags, Message-ID, or provider delivery
+records before deciding whether a narrow manual retry is safe.
+
+`reconciliation needed` means the remote outcome is known, but invalidating the
+local metadata projection failed. The projection is disposable; correct the
+operational database problem and refresh metadata. Do not undo or repeat the
+provider effect merely to repair local index state.
+
 ## HTTP requests are rejected by `Host` or `Origin` validation
 
 For a container, proxy, or non-loopback hostname, configure the names seen by
@@ -229,10 +440,45 @@ avoid configuring an explicit allowlist.
 
 See [DNS rebinding protection](transports.md#dns-rebinding-protection).
 
+## Legacy import reports a conflict or missing credential
+
+Run `mcp-email-server config import-legacy` without `--apply` to preview again.
+A conflict means the managed destination differs from the effective legacy
+account, collides after managed name normalization, or retains that name from a
+soft removal. Planning also rejects normalized collisions within the source and
+account-limit overflow. Import checks all such conditions before resolving
+secrets or writing, and it will not overwrite the destination. Use a fresh
+database or reconcile the destination manually.
+
+Preview includes complete environment-only accounts and environment policy
+overrides with legacy runtime precedence, but never reads their secret values or
+the keyring. Run `config import-legacy --apply`, review the full non-secret plan,
+and type `IMPORT` only when a changed plan prompts. Apply reads required current
+TOML, environment, or keyring credentials. If it reports a missing credential,
+unlock or repair the legacy keyring entry or restore the environment value and
+repeat the reviewed apply. A stale-preview error means the effective source,
+selected catalog path/bootstrap revision, or an exact catalog, policy, or
+account target revision changed; create and review a new preview rather than
+retrying an old confirmation. Matching account rows are reused and only missing
+bindings are filled. Once every source account type is supported, even when every
+row is already present, run `--apply` without a confirmation prompt or choose
+**Finish setup**: finalization privately verifies that each active managed
+password equals the current legacy password before cutover.
+`import_credential_conflict` means they differ; update or remove the
+managed credential and preview again. Import does not guess which password should
+win and overwrites neither side. A failed credential save leaves destination
+authority unchanged and legacy runtime selected; cleanup-required results need
+the reported cleanup. A fully successful
+import selects managed automatically only when all source account types are
+supported. Unsupported providers keep legacy selected until the user explicitly
+chooses otherwise. TOML, environment, and legacy keyring entries are never
+deleted.
+
 ## Duplicate account name
 
 Account names must be unique across all stored account types. Choose a new
-`account_name`, or remove the existing account before adding its replacement.
+`account_name`. Soft removal does not release a name: its normalized tombstone
+remains reserved permanently in this delivery.
 
 An environment account with the same name as a TOML email account is the one
 exception: it intentionally replaces that account in the runtime view.

@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import contextlib
 import imaplib
+import importlib.metadata
 import os
 import re
 import smtplib
+import sqlite3
+import subprocess
 import sys
 import time
 import uuid
@@ -23,6 +26,9 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.types import TextContent
 
+from mcp_email_server.bootstrap import read_bootstrap
+from mcp_email_server.managed import SCHEMA_VERSION
+
 pytestmark = pytest.mark.e2e
 
 SMTP_HOST = "127.0.0.1"
@@ -34,6 +40,7 @@ BOB = ("bob@example.test", "bob-password")
 
 CONFIG_TEMPLATE = f"""credential_storage = "plaintext"
 enable_attachment_download = true
+allowed_recipients = ["bob@example.test"]
 
 [[emails]]
 account_name = "alice"
@@ -160,16 +167,42 @@ def _wait_for_message(credentials: tuple[str, str], mailbox: str, subject: str, 
     pytest.fail(f"Message {subject!r} did not arrive in {mailbox!r}")
 
 
-def _seed_message(subject: str, body: str) -> None:
+def _seed_message_as(
+    sender: tuple[str, str],
+    recipient: str,
+    subject: str,
+    body: str,
+) -> None:
     message = EmailMessage()
-    message["From"] = ALICE[0]
-    message["To"] = BOB[0]
+    message["From"] = sender[0]
+    message["To"] = recipient
     message["Subject"] = subject
     message["Message-ID"] = make_msgid(domain="example.test")
     message.set_content(body)
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=5) as smtp:
-        smtp.login(*ALICE)
+        smtp.login(*sender)
         smtp.send_message(message)
+
+
+def _seed_message(subject: str, body: str) -> None:
+    _seed_message_as(ALICE, BOB[0], subject, body)
+
+
+def _mark_deleted_without_expunge(credentials: tuple[str, str], mailbox: str, uid: str) -> None:
+    """Simulate another client leaving an unrelated message pending deletion."""
+    with _imap_session(credentials) as client:
+        status, _ = client.select(mailbox)
+        assert status == "OK"
+        status, _ = client.uid("store", uid, "+FLAGS.SILENT", r"(\Deleted)")
+        assert status == "OK"
+
+
+def _add_flags(credentials: tuple[str, str], mailbox: str, uid: str, flags: str) -> None:
+    with _imap_session(credentials) as client:
+        status, _ = client.select(mailbox)
+        assert status == "OK"
+        status, _ = client.uid("store", uid, "+FLAGS.SILENT", f"({flags})")
+        assert status == "OK"
 
 
 def _text_content(result: Any) -> str:
@@ -198,6 +231,520 @@ async def _metadata_for_subject_in_mailbox(
 
 async def _metadata_for_subject(session: ClientSession, account_name: str, subject: str) -> dict[str, Any]:
     return await _metadata_for_subject_in_mailbox(session, account_name, "INBOX", subject)
+
+
+def _run_cli(console_script: Path, env: dict[str, str], arguments: list[str], *, stdin: str | None = None) -> str:
+    completed = subprocess.run(  # noqa: S603 - fixed installed script with test-owned arguments
+        [str(console_script), *arguments],
+        cwd=Path.cwd(),
+        env=env,
+        input=stdin,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr or completed.stdout
+    return completed.stdout
+
+
+@pytest.mark.asyncio
+async def test_managed_cli_setup_restart_and_stdio_list_mailboxes_against_greenmail(tmp_path: Path) -> None:
+    """Prove CLI setup -> test -> restart -> live managed IMAP without catalog activation."""
+    _wait_until_ready()
+    _ensure_empty_mailboxes(ALICE, ["INBOX", "Drafts", "Archive"])
+    subject = f"managed-index-{uuid.uuid4().hex}"
+    _seed_message_as(BOB, ALICE[0], subject, "Managed indexed metadata")
+    _wait_for_message(ALICE, "INBOX", subject)
+    app_dir = tmp_path / "managed-app"
+    app_dir.mkdir(mode=0o700)
+    app_dir.chmod(0o700)
+    config_path = app_dir / "config.toml"
+    database = app_dir / "catalog.sqlite3"
+    keyring_path = app_dir / "e2e-keyring.sqlite3"
+    console_script = Path(sys.executable).with_name("mcp-email-server")
+    assert console_script.is_file()
+    server_env = {key: value for key, value in os.environ.items() if not key.startswith("MCP_EMAIL_SERVER_")}
+    server_env.update({
+        "MCP_EMAIL_SERVER_CONFIG_PATH": str(config_path),
+        "MCP_EMAIL_SERVER_E2E_KEYRING_PATH": str(keyring_path),
+        "MCP_EMAIL_SERVER_LOG_LEVEL": "WARNING",
+        "PYTHON_KEYRING_BACKEND": "dev.greenmail.file_keyring.FileKeyring",
+        "PYTHONPATH": str(Path.cwd()),
+    })
+
+    _run_cli(console_script, server_env, ["config", "init", "--database", str(database)])
+    bootstrap = read_bootstrap(config_path)
+    assert bootstrap.mode == "managed"
+    assert bootstrap.db_path == database
+    assert not config_path.exists()
+    add_arguments = [
+        "account",
+        "add",
+        "alice-managed",
+        "--email",
+        ALICE[0],
+        "--full-name",
+        "Alice Managed",
+        "--imap-host",
+        IMAP_HOST,
+        "--imap-port",
+        str(IMAP_PORT),
+        "--imap-user",
+        ALICE[0],
+        "--no-imap-ssl",
+        "--password-stdin",
+    ]
+    assert ALICE[1] not in add_arguments
+    add_output = _run_cli(console_script, server_env, add_arguments, stdin=f"{ALICE[1]}\n")
+    assert ALICE[1] not in add_output
+    test_output = _run_cli(console_script, server_env, ["account", "test", "alice-managed"])
+    assert "connectivity test passed" in test_output
+    assert read_bootstrap(config_path).mode == "managed"
+    assert not config_path.exists()
+
+    server = StdioServerParameters(
+        command=str(console_script),
+        args=["stdio"],
+        env=server_env,
+        cwd=Path.cwd(),
+    )
+    async with stdio_client(server) as (read_stream, write_stream):
+        async with ClientSession(
+            read_stream,
+            write_stream,
+            read_timeout_seconds=timedelta(seconds=15),
+        ) as session:
+            await session.initialize()
+            accounts = await _call_tool(session, "list_available_accounts", {})
+            assert [account["account_name"] for account in accounts["result"]] == ["alice-managed"]
+            assert ALICE[1] not in str(accounts)
+            mailboxes = await _call_tool(session, "list_mailboxes", {"account_name": "alice-managed"})
+            assert "INBOX" in {mailbox["name"] for mailbox in mailboxes["result"]}
+            metadata = await _call_tool(
+                session,
+                "list_emails_metadata",
+                {"account_name": "alice-managed", "page_size": 10},
+            )
+            assert metadata["total"] == 1
+            assert metadata["emails"][0]["subject"] == subject
+            with contextlib.closing(sqlite3.connect(database)) as connection:
+                assert connection.execute("SELECT version FROM schema_metadata").fetchone()[0] == SCHEMA_VERSION
+                assert connection.execute("SELECT completeness FROM index_coverage").fetchone()[0] == "COMPLETE"
+
+            managed_uid = metadata["emails"][0]["email_id"]
+            mark = await _call_tool(
+                session,
+                "mark_emails_as_read",
+                {"account_name": "alice-managed", "email_ids": [managed_uid]},
+            )
+            assert mark["result"] == "Successfully marked 1 email(s) as read"
+            assert r"\Seen" in _wait_for_message(ALICE, "INBOX", subject).flags
+            with contextlib.closing(sqlite3.connect(database)) as connection:
+                assert connection.execute("SELECT COUNT(*) FROM index_coverage").fetchone()[0] == 0
+
+            refreshed = await _call_tool(
+                session,
+                "list_emails_metadata",
+                {"account_name": "alice-managed", "page_size": 10},
+            )
+            assert refreshed["total"] == 1
+            move = await _call_tool(
+                session,
+                "move_emails",
+                {
+                    "account_name": "alice-managed",
+                    "email_ids": [managed_uid],
+                    "source_mailbox": "INBOX",
+                    "destination_mailbox": "Archive",
+                },
+            )
+            assert move["result"] == "Successfully moved 1 email(s) to Archive"
+            assert _find_message(ALICE, "INBOX", subject) is None
+            _wait_for_message(ALICE, "Archive", subject)
+            with contextlib.closing(sqlite3.connect(database)) as connection:
+                assert connection.execute("SELECT COUNT(*) FROM index_coverage").fetchone()[0] == 0
+
+            draft_subject = f"managed-draft-{uuid.uuid4().hex}"
+            saved = await _call_tool(
+                session,
+                "save_to_mailbox",
+                {
+                    "account_name": "alice-managed",
+                    "recipients": [BOB[0]],
+                    "subject": draft_subject,
+                    "body": "Managed draft body",
+                    "mailbox": "Drafts",
+                },
+            )
+            assert "Email saved to 'Drafts' successfully" in saved["result"]
+            draft = _wait_for_message(ALICE, "Drafts", draft_subject)
+            draft_page = await _call_tool(
+                session,
+                "list_emails_metadata",
+                {"account_name": "alice-managed", "mailbox": "Drafts", "page_size": 10},
+            )
+            assert draft_page["total"] == 1
+            deleted = await _call_tool(
+                session,
+                "delete_emails",
+                {
+                    "account_name": "alice-managed",
+                    "email_ids": [draft.uid],
+                    "mailbox": "Drafts",
+                },
+            )
+            assert deleted["result"] == "Successfully deleted 1 email(s)"
+            assert _find_message(ALICE, "Drafts", draft_subject) is None
+            with contextlib.closing(sqlite3.connect(database)) as connection:
+                remaining = connection.execute(
+                    """SELECT COUNT(*) FROM index_coverage c
+                       JOIN mailbox_projection m ON m.id = c.mailbox_id
+                       WHERE m.remote_name = 'Drafts'"""
+                ).fetchone()[0]
+                assert remaining == 0
+
+            invalid = await session.call_tool(
+                "mark_emails_as_read",
+                arguments={"account_name": "alice-managed", "email_ids": ["01"]},
+            )
+            assert invalid.isError is True
+            validation_error = _text_content(invalid)
+            assert "email_ids.0" in validation_error
+            assert "pattern" in validation_error.lower()
+
+            # Disablement commits in a separate management process and must be
+            # observed before the next provider access in this same stdio session.
+            _run_cli(
+                console_script,
+                server_env,
+                ["account", "disable", "alice-managed", "--expected-revision", "2"],
+            )
+            denied = await session.call_tool("list_mailboxes", arguments={"account_name": "alice-managed"})
+            assert denied.isError is True
+            assert "not found" in _text_content(denied).lower()
+            denied_metadata = await session.call_tool(
+                "list_emails_metadata",
+                arguments={"account_name": "alice-managed"},
+            )
+            assert denied_metadata.isError is True
+            assert "not found" in _text_content(denied_metadata).lower()
+            denied_mutation = await session.call_tool(
+                "mark_emails_as_read",
+                arguments={"account_name": "alice-managed", "email_ids": [managed_uid]},
+            )
+            assert denied_mutation.isError is True
+            assert "not found" in _text_content(denied_mutation).lower()
+
+            # Credential detachment, replacement, re-enable, active update, and
+            # soft removal must all be observed by the already-running server.
+            _run_cli(
+                console_script,
+                server_env,
+                [
+                    "account",
+                    "remove-secret",
+                    "alice-managed",
+                    "incoming",
+                    "--expected-revision",
+                    "3",
+                ],
+            )
+            _run_cli(
+                console_script,
+                server_env,
+                ["account", "set-secret", "alice-managed", "incoming", "--password-stdin"],
+                stdin=f"{ALICE[1]}\n",
+            )
+            _run_cli(
+                console_script,
+                server_env,
+                ["account", "enable", "alice-managed", "--expected-revision", "5"],
+            )
+            restored = await _call_tool(session, "list_mailboxes", {"account_name": "alice-managed"})
+            assert "INBOX" in {mailbox["name"] for mailbox in restored["result"]}
+            _run_cli(
+                console_script,
+                server_env,
+                [
+                    "account",
+                    "update",
+                    "alice-managed",
+                    "--expected-revision",
+                    "6",
+                    "--name",
+                    "alice-managed-updated",
+                ],
+            )
+            updated_accounts = await _call_tool(session, "list_available_accounts", {})
+            assert [account["account_name"] for account in updated_accounts["result"]] == ["alice-managed-updated"]
+            _run_cli(
+                console_script,
+                server_env,
+                ["account", "disable", "alice-managed-updated", "--expected-revision", "7"],
+            )
+            _run_cli(
+                console_script,
+                server_env,
+                [
+                    "account",
+                    "remove",
+                    "alice-managed-updated",
+                    "--expected-revision",
+                    "8",
+                    "--confirm",
+                    "alice-managed-updated",
+                ],
+            )
+            removed = await session.call_tool("list_mailboxes", arguments={"account_name": "alice-managed-updated"})
+            assert removed.isError is True
+            assert "not found" in _text_content(removed).lower()
+
+
+@pytest.mark.asyncio
+async def test_explicit_legacy_import_preview_apply_and_managed_stdio_against_greenmail(tmp_path: Path) -> None:
+    """Prove effective legacy preview, confirmed import, automatic cutover, and stdio."""
+    _wait_until_ready()
+    app_dir = tmp_path / "managed-import"
+    app_dir.mkdir(mode=0o700)
+    app_dir.chmod(0o700)
+    config_path = app_dir / "config.toml"
+    config_path.write_text(CONFIG_TEMPLATE)
+    config_path.chmod(0o600)
+    database = app_dir / "catalog.sqlite3"
+    keyring_path = app_dir / "e2e-keyring.sqlite3"
+    console_script = Path(sys.executable).with_name("mcp-email-server")
+    server_env = {key: value for key, value in os.environ.items() if not key.startswith("MCP_EMAIL_SERVER_")}
+    server_env.update({
+        "MCP_EMAIL_SERVER_CONFIG_PATH": str(config_path),
+        "MCP_EMAIL_SERVER_E2E_KEYRING_PATH": str(keyring_path),
+        "MCP_EMAIL_SERVER_LOG_LEVEL": "WARNING",
+        "PYTHON_KEYRING_BACKEND": "dev.greenmail.file_keyring.FileKeyring",
+        "PYTHONPATH": str(Path.cwd()),
+        # A complete environment account proves effective legacy composition.
+        "MCP_EMAIL_SERVER_ACCOUNT_NAME": "environment-only",
+        "MCP_EMAIL_SERVER_EMAIL_ADDRESS": ALICE[0],
+        "MCP_EMAIL_SERVER_PASSWORD": ALICE[1],
+        "MCP_EMAIL_SERVER_IMAP_HOST": IMAP_HOST,
+        "MCP_EMAIL_SERVER_IMAP_PORT": str(IMAP_PORT),
+        "MCP_EMAIL_SERVER_IMAP_SSL": "false",
+    })
+
+    _run_cli(console_script, server_env, ["config", "init", "--database", str(database)])
+    stored_source = config_path.read_bytes()
+    preview = _run_cli(console_script, server_env, ["config", "import-legacy"])
+    assert "account=alice action=create" in preview
+    assert "account=bob action=create" in preview
+    assert "account=environment-only action=create" in preview
+    assert "secret_source=environment" in preview
+    assert ALICE[1] not in preview
+    with contextlib.closing(sqlite3.connect(database)) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM managed_account").fetchone()[0] == 0
+
+    applied = _run_cli(
+        console_script,
+        server_env,
+        ["config", "import-legacy", "--apply"],
+        stdin="IMPORT\n",
+    )
+    assert "created=environment-only,alice,bob" in applied
+    assert config_path.read_bytes() == stored_source
+    bootstrap = read_bootstrap(config_path)
+    assert bootstrap.mode == "managed"
+    assert bootstrap.db_path == database
+    assert bootstrap.revision == 2
+    test_output = _run_cli(console_script, server_env, ["account", "test", "alice"])
+    assert "connectivity test passed" in test_output
+    environment_test = _run_cli(console_script, server_env, ["account", "test", "environment-only"])
+    assert "connectivity test passed" in environment_test
+
+    server = StdioServerParameters(
+        command=str(console_script),
+        args=["stdio"],
+        env=server_env,
+        cwd=Path.cwd(),
+    )
+    async with stdio_client(server) as (read_stream, write_stream):
+        async with ClientSession(
+            read_stream,
+            write_stream,
+            read_timeout_seconds=timedelta(seconds=15),
+        ) as session:
+            await session.initialize()
+            accounts = await _call_tool(session, "list_available_accounts", {})
+            assert {account["account_name"] for account in accounts["result"]} == {
+                "alice",
+                "bob",
+                "environment-only",
+            }
+            mailboxes = await _call_tool(session, "list_mailboxes", {"account_name": "alice"})
+            assert "INBOX" in {mailbox["name"] for mailbox in mailboxes["result"]}
+
+
+@pytest.mark.asyncio
+async def test_managed_stdio_missing_database_fails_closed_without_legacy_fallback(tmp_path: Path) -> None:
+    """A selected managed catalog cannot silently fall back to preserved TOML rows."""
+    app_dir = tmp_path / "managed-fail-closed"
+    app_dir.mkdir(mode=0o700)
+    app_dir.chmod(0o700)
+    config_path = app_dir / "config.toml"
+    database = app_dir / "catalog.sqlite3"
+    keyring_path = app_dir / "e2e-keyring.sqlite3"
+    console_script = Path(sys.executable).with_name("mcp-email-server")
+    server_env = {key: value for key, value in os.environ.items() if not key.startswith("MCP_EMAIL_SERVER_")}
+    server_env.update({
+        "MCP_EMAIL_SERVER_CONFIG_PATH": str(config_path),
+        "MCP_EMAIL_SERVER_E2E_KEYRING_PATH": str(keyring_path),
+        "MCP_EMAIL_SERVER_LOG_LEVEL": "WARNING",
+        "PYTHON_KEYRING_BACKEND": "dev.greenmail.file_keyring.FileKeyring",
+        "PYTHONPATH": str(Path.cwd()),
+    })
+    _run_cli(console_script, server_env, ["config", "init", "--database", str(database)])
+    _run_cli(
+        console_script,
+        server_env,
+        [
+            "account",
+            "add",
+            "managed-only",
+            "--email",
+            ALICE[0],
+            "--full-name",
+            "Managed Only",
+            "--imap-host",
+            IMAP_HOST,
+            "--imap-port",
+            str(IMAP_PORT),
+            "--imap-user",
+            ALICE[0],
+            "--no-imap-ssl",
+            "--password-stdin",
+        ],
+        stdin=f"{ALICE[1]}\n",
+    )
+    # Preserve a complete legacy account as a fallback tripwire. Managed startup
+    # must ignore it even when the selected database disappears.
+    with config_path.open("a") as destination:
+        destination.write("\n" + CONFIG_TEMPLATE)
+    config_path.chmod(0o600)
+    missing_path = database.with_suffix(".missing")
+    database.rename(missing_path)
+
+    completed = subprocess.run(  # noqa: S603 - fixed installed script and literal stdio command
+        [str(console_script), "stdio"],
+        cwd=Path.cwd(),
+        env=server_env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    output = completed.stdout + completed.stderr
+    assert completed.returncode == 1
+    assert "missing" in output.lower()
+    assert "alice-password" not in output
+    assert "alice" not in output.lower()
+
+
+@pytest.mark.asyncio
+async def test_metadata_index_paging_fallback_and_restart_reuse_against_greenmail(tmp_path: Path) -> None:
+    """Exercise population, qualified SQLite reuse, filters, bounds, and restart."""
+    _wait_until_ready()
+    _ensure_empty_mailboxes(BOB, ["INBOX"])
+    run_id = uuid.uuid4().hex
+    subjects = [f"metadata-index-{run_id}-{number}" for number in range(5)]
+    for number, subject in enumerate(subjects):
+        _seed_message(subject, f"indexed body {number}; unique needle {run_id}-{number}")
+        _wait_for_message(BOB, "INBOX", subject)
+    flagged = _wait_for_message(BOB, "INBOX", subjects[2])
+    _add_flags(BOB, "INBOX", flagged.uid, r"\Seen \Flagged")
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(CONFIG_TEMPLATE)
+    config_path.chmod(0o600)
+    database = tmp_path / "db.sqlite3"
+    server_env = {key: value for key, value in os.environ.items() if not key.startswith("MCP_EMAIL_SERVER_")}
+    server_env.update({
+        "MCP_EMAIL_SERVER_CONFIG_PATH": str(config_path),
+        "MCP_EMAIL_SERVER_CREDENTIAL_STORAGE": "plaintext",
+        "MCP_EMAIL_SERVER_LOG_LEVEL": "WARNING",
+    })
+    console_script = Path(sys.executable).with_name("mcp-email-server")
+    server = StdioServerParameters(
+        command=str(console_script),
+        args=["stdio"],
+        env=server_env,
+        cwd=Path.cwd(),
+    )
+
+    async def exercise_session(*, verify_filters: bool) -> tuple[str, dict[str, Any]]:
+        async with stdio_client(server) as (read_stream, write_stream):
+            async with ClientSession(
+                read_stream,
+                write_stream,
+                read_timeout_seconds=timedelta(seconds=15),
+            ) as session:
+                await session.initialize()
+                first = await _call_tool(
+                    session,
+                    "list_emails_metadata",
+                    {"account_name": "bob", "page": 1, "page_size": 2},
+                )
+                assert first["total"] == 5
+                assert len(first["emails"]) == 2
+                assert [int(email["email_id"]) for email in first["emails"]] == sorted(
+                    [int(email["email_id"]) for email in first["emails"]], reverse=True
+                )
+                with contextlib.closing(sqlite3.connect(database)) as connection:
+                    coverage = connection.execute(
+                        "SELECT completeness, message_count, observed_at FROM index_coverage"
+                    ).fetchone()
+                    rows = connection.execute("SELECT COUNT(*) FROM message_metadata_projection").fetchone()[0]
+                assert coverage is not None
+                assert coverage[0:2] == ("COMPLETE", 5)
+                assert rows == 5
+
+                second = await _call_tool(
+                    session,
+                    "list_emails_metadata",
+                    {"account_name": "bob", "page": 2, "page_size": 2},
+                )
+                assert second["total"] == 5
+                assert len(second["emails"]) == 2
+                with contextlib.closing(sqlite3.connect(database)) as connection:
+                    reused_at = connection.execute("SELECT observed_at FROM index_coverage").fetchone()[0]
+                assert reused_at == coverage[2]
+
+                if verify_filters:
+                    filter_cases = [
+                        ({"subject": subjects[1]}, 1),
+                        ({"from_address": ALICE[0]}, 5),
+                        ({"to_address": BOB[0]}, 5),
+                        ({"seen": True}, 1),
+                        ({"flagged": True}, 1),
+                        ({"body": f"unique needle {run_id}-4"}, 1),
+                        ({"text": subjects[3]}, 1),
+                        ({"has_attachment": False}, 5),
+                        ({"has_attachment": True}, 0),
+                    ]
+                    for filters, expected_total in filter_cases:
+                        result = await _call_tool(
+                            session,
+                            "list_emails_metadata",
+                            {"account_name": "bob", "page_size": 10, **filters},
+                        )
+                        assert result["total"] == expected_total, (filters, result)
+                    invalid = await session.call_tool(
+                        "list_emails_metadata",
+                        arguments={"account_name": "bob", "page_size": 101},
+                    )
+                    assert invalid.isError is True
+                return coverage[2], first
+
+    first_observed_at, first_page = await exercise_session(verify_filters=True)
+    restart_observed_at, restart_page = await exercise_session(verify_filters=False)
+    assert restart_observed_at == first_observed_at
+    assert restart_page == first_page
 
 
 @pytest.mark.asyncio
@@ -241,6 +788,7 @@ async def test_current_stdio_server_against_greenmail(tmp_path: Path) -> None:
         ) as session:
             initialized = await session.initialize()
             assert initialized.serverInfo.name == "email"
+            assert initialized.serverInfo.version == importlib.metadata.version("mcp-email-server")
 
             tools = await session.list_tools()
             tool_names = {tool.name for tool in tools.tools}
@@ -283,6 +831,22 @@ async def test_current_stdio_server_against_greenmail(tmp_path: Path) -> None:
 
             sent_copy = _wait_for_message(ALICE, "Sent", sent_subject)
             assert sent_body in sent_copy.message.get_body(preferencelist=("plain",)).get_content()
+
+            denied_subject = f"mcp-e2e-denied-send-{run_id}"
+            denied_recipient = f"missing-{run_id}@example.test"
+            denied_send = await session.call_tool(
+                "send_email",
+                arguments={
+                    "account_name": "alice",
+                    "recipients": [BOB[0], denied_recipient],
+                    "subject": denied_subject,
+                    "body": "Recipient policy must reject before SMTP",
+                },
+            )
+            assert denied_send.isError is True
+            assert "not in allowlist" in _text_content(denied_send)
+            assert _find_message(BOB, "INBOX", denied_subject) is None
+            assert _find_message(ALICE, "Sent", denied_subject) is None
 
             sent_metadata = await _metadata_for_subject(session, "bob", sent_subject)
             assert sent_metadata["sender"].endswith("<alice@example.test>") or sent_metadata["sender"] == ALICE[0]
@@ -381,6 +945,59 @@ async def test_current_stdio_server_against_greenmail(tmp_path: Path) -> None:
             )
             assert delete_draft["result"] == "Successfully deleted 1 email(s)"
             assert _find_message(ALICE, "Drafts", draft_subject) is None
+
+            # Another IMAP client may already have left an unrelated message with
+            # \\Deleted set. A message-scoped MCP delete must expunge only its own
+            # target rather than silently committing the other client's deletion.
+            pending_subject = f"mcp-e2e-unrelated-pending-delete-{run_id}"
+            delete_subject = f"mcp-e2e-scoped-delete-{run_id}"
+            _seed_message(pending_subject, "Leave this message pending deletion")
+            _seed_message(delete_subject, "Delete only this message")
+            pending = _wait_for_message(BOB, "INBOX", pending_subject)
+            _wait_for_message(BOB, "INBOX", delete_subject)
+            delete_metadata = await _metadata_for_subject(session, "bob", delete_subject)
+            _mark_deleted_without_expunge(BOB, "INBOX", pending.uid)
+            assert r"\Deleted" in _wait_for_message(BOB, "INBOX", pending_subject).flags
+
+            scoped_delete = await _call_tool(
+                session,
+                "delete_emails",
+                {
+                    "account_name": "bob",
+                    "email_ids": [delete_metadata["email_id"]],
+                    "mailbox": "INBOX",
+                },
+            )
+            assert scoped_delete["result"] == "Successfully deleted 1 email(s)"
+            assert _find_message(BOB, "INBOX", delete_subject) is None
+            still_pending = _wait_for_message(BOB, "INBOX", pending_subject)
+            assert r"\Deleted" in still_pending.flags
+
+            # Native MOVE must preserve the same unrelated pending deletion too.
+            move_pending_subject = f"mcp-e2e-unrelated-pending-move-{run_id}"
+            move_target_subject = f"mcp-e2e-scoped-move-{run_id}"
+            _seed_message(move_pending_subject, "Leave this message pending while another moves")
+            _seed_message(move_target_subject, "Move only this message")
+            move_pending = _wait_for_message(BOB, "INBOX", move_pending_subject)
+            _wait_for_message(BOB, "INBOX", move_target_subject)
+            move_target_metadata = await _metadata_for_subject(session, "bob", move_target_subject)
+            _mark_deleted_without_expunge(BOB, "INBOX", move_pending.uid)
+
+            scoped_move = await _call_tool(
+                session,
+                "move_emails",
+                {
+                    "account_name": "bob",
+                    "email_ids": [move_target_metadata["email_id"]],
+                    "source_mailbox": "INBOX",
+                    "destination_mailbox": "Archive",
+                },
+            )
+            assert scoped_move["result"] == "Successfully moved 1 email(s) to Archive"
+            assert _find_message(BOB, "INBOX", move_target_subject) is None
+            _wait_for_message(BOB, "Archive", move_target_subject)
+            still_pending_after_move = _wait_for_message(BOB, "INBOX", move_pending_subject)
+            assert r"\Deleted" in still_pending_after_move.flags
 
             mailboxes = await _call_tool(session, "list_mailboxes", {"account_name": "alice"})
             mailbox_names = {mailbox["name"] for mailbox in mailboxes["result"]}

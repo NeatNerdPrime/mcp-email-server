@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from mcp_email_server.application.mutations import AppendMutationOutcome
 from mcp_email_server.config import EmailServer, EmailSettings
 from mcp_email_server.emails.classic import ClassicEmailHandler, EmailClient, _validate_flags
 
@@ -191,6 +192,23 @@ class TestComposeMessage:
         assert msg.get_content_type() == "multipart/mixed"
 
 
+def test_compose_message_preserves_attachment_mime_main_type(email_client, tmp_path) -> None:
+    image = tmp_path / "pixel.png"
+    payload = b"\x89PNG\r\n\x1a\ncontent"
+    image.write_bytes(payload)
+
+    message = email_client.compose_message(
+        recipients=["r@example.com"],
+        subject="Image",
+        body="see attached",
+        attachments=[str(image)],
+    )
+    attachment = next(part for part in message.walk() if part.get_filename() == "pixel.png")
+
+    assert attachment.get_content_type() == "image/png"
+    assert attachment.get_payload(decode=True) == payload
+
+
 class TestComposeMessageBccHeader:
     """Tests for BCC header inclusion in compose_message."""
 
@@ -299,8 +317,9 @@ class TestAppendToMailbox:
         msg = MIMEText("body")
         with patch("mcp_email_server.emails.classic.aioimaplib") as mock_lib:
             mock_lib.IMAP4_SSL.return_value = mock_imap
-            result = await email_client.append_to_mailbox(msg, incoming_server, "Drafts")
-        assert result is None
+            with pytest.raises(ConnectionError, match=r"IMAP login failed \(TRANSPORT\)") as exc_info:
+                await email_client.append_to_mailbox(msg, incoming_server, "Drafts")
+        assert "Auth failed" not in str(exc_info.value)
 
     @pytest.mark.asyncio
     async def test_append_imap_append_fails(self, email_client, incoming_server, mock_imap):
@@ -474,82 +493,54 @@ class TestSaveToMailboxBcc:
 # ---------------------------------------------------------------------------
 
 
-class TestSaveToMailboxTool:
-    """Tests for the save_to_mailbox MCP tool in app.py."""
+@pytest.mark.asyncio
+async def test_save_to_mailbox_tool_success(monkeypatch):
+    command_handler = AsyncMock(
+        return_value=AppendMutationOutcome("succeeded", "<msg-id@example.com>", uid="42", mailbox="Drafts")
+    )
+    monkeypatch.setattr("mcp_email_server.app.save_to_mailbox_command", command_handler)
 
-    @pytest.mark.asyncio
-    async def test_save_to_mailbox_tool_success(self, monkeypatch):
-        mock_handler = AsyncMock()
-        mock_handler.save_to_mailbox = AsyncMock(return_value="<msg-id@example.com>|uid:42")
-        monkeypatch.setattr("mcp_email_server.app.dispatch_handler", lambda _: mock_handler)
+    from mcp_email_server.app import save_to_mailbox
 
-        from mcp_email_server.app import save_to_mailbox
+    result = await save_to_mailbox("test", ["r@example.com"], "Draft", "body")
+    assert "Drafts" in result
+    assert "<msg-id@example.com>" in result
+    assert "email_id: 42" in result
 
-        result = await save_to_mailbox(
-            account_name="test",
-            recipients=["r@example.com"],
-            subject="Draft",
-            body="body",
-        )
-        assert "Drafts" in result
-        assert "<msg-id@example.com>" in result
-        assert "email_id: 42" in result
 
-    @pytest.mark.asyncio
-    async def test_save_to_mailbox_tool_imap_only_account(self, monkeypatch, mock_imap):
-        """The MCP tool works end-to-end for an account without SMTP configuration."""
-        imap_only_settings = EmailSettings(
-            account_name="imap_only",
-            full_name="Imap Only",
-            email_address="imap-only@example.com",
-            incoming=EmailServer(**_INCOMING_SERVER),
-        )
-        handler = ClassicEmailHandler(imap_only_settings)
-        monkeypatch.setattr("mcp_email_server.app.dispatch_handler", lambda _: handler)
-        monkeypatch.setattr("mcp_email_server.app.get_settings", lambda: MagicMock(allowed_recipients=[]))
+@pytest.mark.asyncio
+async def test_save_to_mailbox_tool_imap_only_account(monkeypatch):
+    """Saving through the application contract does not require SMTP."""
+    command_handler = AsyncMock(
+        return_value=AppendMutationOutcome("succeeded", "<msg-id@example.com>", uid="7", mailbox="Drafts")
+    )
+    monkeypatch.setattr("mcp_email_server.app.save_to_mailbox_command", command_handler)
 
-        from mcp_email_server.app import save_to_mailbox
+    from mcp_email_server.app import save_to_mailbox
 
-        mock_imap.append = AsyncMock(return_value=("OK", [b"[APPENDUID 1234567890 7] APPEND completed"]))
-        with patch("mcp_email_server.emails.classic.aioimaplib") as mock_lib:
-            mock_lib.IMAP4_SSL.return_value = mock_imap
-            result = await save_to_mailbox(
-                account_name="imap_only",
-                recipients=["r@example.com"],
-                subject="Draft",
-                body="body",
-            )
+    result = await save_to_mailbox("imap_only", ["r@example.com"], "Draft", "body")
+    assert "Drafts" in result
+    assert "email_id: 7" in result
 
-        assert "Drafts" in result
-        assert "email_id: 7" in result
 
-    @pytest.mark.asyncio
-    async def test_save_to_mailbox_tool_custom_folder(self, monkeypatch):
-        mock_handler = AsyncMock()
-        mock_handler.save_to_mailbox = AsyncMock(return_value="<msg-id@example.com>|uid:99")
-        monkeypatch.setattr("mcp_email_server.app.dispatch_handler", lambda _: mock_handler)
+@pytest.mark.asyncio
+async def test_save_to_mailbox_tool_custom_folder(monkeypatch):
+    command_handler = AsyncMock(
+        return_value=AppendMutationOutcome("succeeded", "<msg-id@example.com>", uid="99", mailbox="INBOX.Drafts")
+    )
+    monkeypatch.setattr("mcp_email_server.app.save_to_mailbox_command", command_handler)
 
-        from mcp_email_server.app import save_to_mailbox
+    from mcp_email_server.app import save_to_mailbox
 
-        result = await save_to_mailbox(
-            account_name="test",
-            recipients=["r@example.com"],
-            subject="Draft",
-            body="body",
-            mailbox="INBOX.Drafts",
-            flags=[r"\Draft", r"\Seen"],
-        )
-        assert "INBOX.Drafts" in result
-        mock_handler.save_to_mailbox.assert_called_once_with(
-            ["r@example.com"],
-            "Draft",
-            "body",
-            "INBOX.Drafts",
-            None,
-            None,
-            False,
-            None,
-            None,
-            None,
-            [r"\Draft", r"\Seen"],
-        )
+    result = await save_to_mailbox(
+        "test",
+        ["r@example.com"],
+        "Draft",
+        "body",
+        mailbox="INBOX.Drafts",
+        flags=[r"\Draft", r"\Seen"],
+    )
+    assert "INBOX.Drafts" in result
+    command = command_handler.await_args.args[0]
+    assert command.mailbox == "INBOX.Drafts"
+    assert command.flags == (r"\Draft", r"\Seen")

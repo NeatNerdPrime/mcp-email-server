@@ -1,5 +1,9 @@
 # Guides
 
+> **Version scope:** Managed-mode workflows in this page are Local Email App V2
+> behavior. See [Version availability](getting-started.md#version-availability)
+> before using them with a PyPI installation.
+
 These examples cover common configurations that need more control than the
 basic UI provides.
 
@@ -43,10 +47,23 @@ Or configure one through environment variables without
 }
 ```
 
-If no configured account has SMTP, `send_email` is omitted from the MCP tool
-list. IMAP mutation tools remain available, so this is not a strict read-only
-mode. To limit mutations, also constrain which MCP tools the client may call or
-run the server with an account whose provider permissions are read-only.
+`send_email` remains in the static MCP tool list, but calling it for this
+account fails its SMTP capability check before provider access. IMAP mutation
+tools remain available, so this is not a strict read-only mode. To limit
+mutations, also constrain which MCP tools the client may call or run the server
+with an account whose provider permissions are read-only.
+
+## Safe delete and move behavior
+
+Message-scoped deletion never uses mailbox-wide IMAP `EXPUNGE`, which would
+remove every message already marked `\Deleted`, including messages selected by
+another email client. The server uses `UID EXPUNGE` only when the provider
+advertises the RFC 4315 `UIDPLUS` capability.
+
+If a provider lacks `UIDPLUS`, `delete_emails` reports the requested messages as
+failed before changing their flags. When the provider also lacks native `MOVE`,
+`move_emails` rejects its COPY-and-delete fallback before copying anything. Use
+the provider's own client or an IMAP server that supports `MOVE` or `UIDPLUS`.
 
 ## ProtonMail Bridge and self-signed TLS
 
@@ -220,6 +237,83 @@ second = await get_emails_content(
 
 Keep the mailbox argument consistent with the mailbox used to obtain the
 `email_id`.
+
+## Import legacy accounts into a managed catalog
+
+Create the destination while keeping legacy runtime selected, preview the
+effective legacy source, and apply only after reviewing every action:
+
+```bash
+mcp-email-server config init \
+  --database ~/.config/mcp-email-server/catalog.sqlite3
+mcp-email-server config import-legacy
+mcp-email-server config import-legacy --apply
+# Review the displayed plan, then type IMPORT at the prompt.
+mcp-email-server account list
+mcp-email-server account test work incoming
+# Restart MCP clients when config status reports restart_required=true.
+```
+
+The source uses the TOML file selected by `MCP_EMAIL_SERVER_CONFIG_PATH` plus
+the same complete environment-account replacement/addition and policy override
+precedence as legacy runtime. Preview displays endpoint, TLS, user,
+save-to-sent, policy, credential source class, and exact target revision details
+without accessing credential values or the keyring, so it can still show actions
+while the legacy keyring is locked. `--apply` prints that complete plan before
+accepting the interactive `IMPORT` confirmation; a no-op plan does not prompt.
+Apply then fails safely if a required current TOML, environment, or keyring
+credential cannot be read. A full successful import automatically selects
+managed mode. Any failure keeps legacy selected; unsupported provider account
+types are reported and prevent automatic cutover.
+
+A `conflict` means the destination already has a different account with that
+normalized name or retains a soft-removal tombstone. Import never overwrites
+that row.
+Resolve it deliberately by choosing a fresh catalog or reconciling the account
+manually. An exact repeat is `unchanged`; an interrupted matching import
+can report `resume_credentials` and install only missing bindings. The source is
+left untouched in every case.
+
+## Optional Codex and Claude Code plugin
+
+The repository publishes one optional plugin through the Codex and Claude Code
+marketplace manifests. Both manifests reference the same root `.mcp.json`, which
+starts `uvx --from mcp-email-server@latest mcp-email-server-plugin` as a local
+bundled MCP server, plus the canonical `safe-email-operations` skill. The
+plugin-only entry point is absent from legacy releases, so they fail closed
+instead of exposing their older MCP catalog. This local stdio integration is for
+Codex, ChatGPT desktop, and Claude Code hosts that support local plugin processes;
+it is not a remote ChatGPT web connector.
+
+Plugin and Python application releases are independent. The plugin version
+changes only when the bundled manifest, MCP declaration, skill, or related plugin
+content changes. `@latest` deliberately resolves the current published Python
+application, so first use can require network access and the running application
+can advance without a plugin update. Installing the plugin does not store email
+credentials, but enabling it allows the host to resolve the package and start the
+server locally. `uvx` must already be available on `PATH`.
+
+The MCP surface contains mail operations, not account or credential management.
+The skill allows only the bounded `@latest` version check plus `config status
+--json` and `config doctor --json`, validates the JSON schema/command fields, and
+hands all account creation or credential entry back to the user-operated terminal
+or local browser. JSON availability on another command does not grant the agent
+permission to run it. The plugin must never launch the UI, copy its bootstrap URL,
+edit the catalog directly, or accept a secret in chat.
+
+Before installation, inspect the official repository source, both marketplace
+manifests, both plugin manifests, `.mcp.json`, and the canonical skill.
+Installation, update, enablement, and removal are explicit user actions. The
+complete commands and source-verification checklist live in the plugin's
+`references/installation.md`; never curl and execute an installer or put
+repository credentials in a marketplace URL.
+
+If a user asks an agent to add an account or rotate a password, the safe handoff
+is: run `uvx mcp-email-server@latest ui` locally and complete secret entry in the
+browser, or use the documented masked interactive CLI in the user's terminal. Do not
+paste credentials or the one-time UI URL into chat. If no user-controlled
+terminal or browser is available, setup cannot be completed safely through the
+plugin.
 
 ## Containers and CI
 

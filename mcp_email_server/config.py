@@ -23,12 +23,37 @@ from pydantic_settings import (
 )
 
 from mcp_email_server import keyring_store
+from mcp_email_server.application.limits import APPLICATION_LIMITS
+from mcp_email_server.bootstrap import (
+    Bootstrap,
+    Mode,
+    _materialize_bootstrap_locked,
+    assert_legacy_writable,
+    bootstrap_file_lock,
+    process_bootstrap,
+    read_bootstrap,
+)
 from mcp_email_server.log import logger
 
 DEFAULT_CONFIG_PATH = "~/.config/mcp-email-server/config.toml"
 LEGACY_CONFIG_PATH = "~/.config/zerolib/mcp_email_server/config.toml"
 CredentialStorage = Literal["auto", "keyring", "plaintext"]
 _VALID_CREDENTIAL_STORAGE_MODES: tuple[CredentialStorage, ...] = ("auto", "keyring", "plaintext")
+_BOOTSTRAP_FIELDS = {
+    "bootstrap_version",
+    "bootstrap_revision",
+    "mode",
+    "managed_selection",
+    "managed_db_location",
+}
+
+
+class LegacyCredentialMigrationLoadError(ValueError):
+    """Stored legacy configuration could not be loaded inside its transaction."""
+
+
+class LegacyCredentialMigrationStoreError(ValueError):
+    """Legacy credential migration could not commit its configuration and cleanup."""
 
 
 def _is_credential_storage_mode(value: str) -> TypeGuard[CredentialStorage]:
@@ -74,14 +99,38 @@ def sender_allowed(sender: str, patterns: list[str]) -> bool:
     return any(fnmatch.fnmatchcase(addrs[0], pattern.lower()) for pattern in patterns)
 
 
-def _normalize_address_list(raw: Iterable[str]) -> list[str]:
+def normalize_address_list(raw: Iterable[str]) -> list[str]:
     """Normalize each address, drop empties, de-duplicate (order-preserving)."""
     return list(dict.fromkeys(a for a in (normalize_address(x) for x in raw) if a))
 
 
-def _normalize_pattern_list(raw: Iterable[str]) -> list[str]:
+def normalize_pattern_list(raw: Iterable[str]) -> list[str]:
     """Lowercase, strip, de-duplicate (order-preserving). Glob characters are preserved."""
     return list(dict.fromkeys(p.strip().lower() for p in raw if p.strip()))
+
+
+def compose_legacy_policy_environment(
+    *,
+    enable_attachment_download: bool,
+    allowed_recipients: Iterable[str],
+    allowed_senders: Iterable[str],
+    report_blocked_mutations: bool,
+) -> tuple[bool, list[str], list[str], bool]:
+    """Apply legacy policy environment precedence without resolving credentials."""
+    attachment_value = os.getenv("MCP_EMAIL_SERVER_ENABLE_ATTACHMENT_DOWNLOAD")
+    report_value = os.getenv("MCP_EMAIL_SERVER_REPORT_BLOCKED_MUTATIONS")
+    recipients_value = os.getenv("MCP_EMAIL_SERVER_ALLOWED_RECIPIENTS")
+    senders_value = os.getenv("MCP_EMAIL_SERVER_ALLOWED_SENDERS")
+    return (
+        _parse_bool_env(attachment_value, False) if attachment_value is not None else enable_attachment_download,
+        normalize_address_list(recipients_value.split(","))
+        if recipients_value is not None
+        else normalize_address_list(allowed_recipients),
+        normalize_pattern_list(senders_value.split(","))
+        if senders_value is not None
+        else normalize_pattern_list(allowed_senders),
+        _parse_bool_env(report_value, False) if report_value is not None else report_blocked_mutations,
+    )
 
 
 def _reject_sentinel_secret(secret: SecretStr, label: str) -> None:
@@ -101,15 +150,27 @@ def _reject_sentinel_secret(secret: SecretStr, label: str) -> None:
 
 
 def _resolve_config_path() -> Path:
-    """Resolve the config path and copy the legacy default on first use."""
+    """Resolve config and migrate the old legacy default without managed side effects."""
     configured_path = os.getenv("MCP_EMAIL_SERVER_CONFIG_PATH")
     if configured_path:
-        return Path(configured_path).expanduser().resolve()
-
-    config_path = Path(DEFAULT_CONFIG_PATH).expanduser().resolve()
-    legacy_path = Path(LEGACY_CONFIG_PATH).expanduser().resolve()
-    if config_path.exists() or not legacy_path.is_file():
+        config_path = Path(os.path.abspath(Path(configured_path).expanduser()))
+        if config_path.exists() or config_path.is_symlink():
+            read_bootstrap(config_path)
         return config_path
+
+    config_path = Path(os.path.abspath(Path(DEFAULT_CONFIG_PATH).expanduser()))
+    legacy_path = Path(os.path.abspath(Path(LEGACY_CONFIG_PATH).expanduser()))
+    if config_path.exists() or config_path.is_symlink():
+        read_bootstrap(config_path)
+        return config_path
+    if not legacy_path.is_file():
+        return config_path
+
+    # Parse before mkdir/temp/link. An explicitly managed bootstrap remains at
+    # its old location until the user deliberately selects another config path.
+    legacy_bootstrap = read_bootstrap(legacy_path)
+    if legacy_bootstrap.mode == "managed":
+        return legacy_path
 
     temporary_path: Path | None = None
     try:
@@ -366,6 +427,11 @@ class ProviderSettings(AccountAttributes):
 
 
 class Settings(BaseSettings):
+    bootstrap_version: int | None = None
+    bootstrap_revision: int | None = Field(default=None, ge=0)
+    mode: Mode = "legacy"
+    managed_selection: bool | None = None
+    managed_db_location: str | None = None
     emails: list[EmailSettings] = []
     providers: list[ProviderSettings] = []
     db_location: str = CONFIG_PATH.with_name("db.sqlite3").as_posix()
@@ -393,12 +459,6 @@ class Settings(BaseSettings):
         """
         return self._credential_storage_override or self.credential_storage
 
-    def _apply_bool_env_override(self, attr: str, env_var: str) -> None:
-        value = os.getenv(env_var)
-        if value is not None:
-            setattr(self, attr, _parse_bool_env(value, False))
-            logger.info(f"Set {attr}={getattr(self, attr)} from environment variable")
-
     def _pickup_credential_storage_override(self) -> None:
         override = os.getenv("MCP_EMAIL_SERVER_CREDENTIAL_STORAGE")
         if override is None:
@@ -419,9 +479,9 @@ class Settings(BaseSettings):
         # TOML normalisation is unconditional (safe during migration loads too): it
         # only reshapes values already in the file, independent of env state.
         if self.allowed_recipients:
-            self.allowed_recipients = _normalize_address_list(self.allowed_recipients)
+            self.allowed_recipients = normalize_address_list(self.allowed_recipients)
         if self.allowed_senders:
-            self.allowed_senders = _normalize_pattern_list(self.allowed_senders)
+            self.allowed_senders = normalize_pattern_list(self.allowed_senders)
 
         if not migration_load:
             self._apply_env_overrides()
@@ -438,22 +498,19 @@ class Settings(BaseSettings):
         self._resolve_keyring_sentinels(migration_load=migration_load, pending=pending)
 
     def _apply_env_overrides(self) -> None:
-        """Env-composited state, skipped entirely during migration loads (§7) so
-        migration transforms the stored config, not the env-composited view.
-        """
+        """Compose the effective legacy runtime view from file and environment."""
         self._pickup_credential_storage_override()
-        self._apply_bool_env_override("enable_attachment_download", "MCP_EMAIL_SERVER_ENABLE_ATTACHMENT_DOWNLOAD")
-        self._apply_bool_env_override("report_blocked_mutations", "MCP_EMAIL_SERVER_REPORT_BLOCKED_MUTATIONS")
-
-        # Environment variable overrides TOML (comma-separated); an empty string clears the allowlist.
-        env_allowed = os.getenv("MCP_EMAIL_SERVER_ALLOWED_RECIPIENTS")
-        if env_allowed is not None:
-            self.allowed_recipients = _normalize_address_list(env_allowed.split(","))
-
-        env_senders = os.getenv("MCP_EMAIL_SERVER_ALLOWED_SENDERS")
-        if env_senders is not None:
-            self.allowed_senders = _normalize_pattern_list(env_senders.split(","))
-
+        (
+            self.enable_attachment_download,
+            self.allowed_recipients,
+            self.allowed_senders,
+            self.report_blocked_mutations,
+        ) = compose_legacy_policy_environment(
+            enable_attachment_download=self.enable_attachment_download,
+            allowed_recipients=self.allowed_recipients,
+            allowed_senders=self.allowed_senders,
+            report_blocked_mutations=self.report_blocked_mutations,
+        )
         self._inject_env_account()
 
     def _inject_env_account(self) -> None:
@@ -584,6 +641,12 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def check_unique_account_names(self) -> Settings:
+        if len(self.emails) + len(self.providers) > APPLICATION_LIMITS.configured_accounts:
+            raise ValueError(f"Configured accounts exceed the limit of {APPLICATION_LIMITS.configured_accounts}")
+        if len(self.allowed_recipients) > APPLICATION_LIMITS.policy_entries:
+            raise ValueError(f"Allowed recipients exceed the limit of {APPLICATION_LIMITS.policy_entries}")
+        if len(self.allowed_senders) > APPLICATION_LIMITS.policy_entries:
+            raise ValueError(f"Allowed senders exceed the limit of {APPLICATION_LIMITS.policy_entries}")
         account_names = set()
         for email in self.emails:
             if email.account_name in account_names:
@@ -609,7 +672,7 @@ class Settings(BaseSettings):
 
     def _to_toml(self, *, use_keyring: bool = False, credential_storage: CredentialStorage | None = None) -> str:
         context = {"secrets": "keyring"} if use_keyring else None
-        data = self.model_dump(exclude_none=True, context=context)
+        data = self.model_dump(exclude=_BOOTSTRAP_FIELDS, exclude_none=True, context=context)
         if credential_storage is not None:
             data["credential_storage"] = credential_storage
         return tomli_w.dumps(data)
@@ -646,6 +709,7 @@ class Settings(BaseSettings):
 
     @staticmethod
     def _write_toml(toml_file: Path, content: str) -> None:
+        assert_legacy_writable("write legacy settings", toml_file)
         if os.name != "posix":
             toml_file.write_text(content)
             return
@@ -679,16 +743,38 @@ class Settings(BaseSettings):
                 os.unlink(tmp_name)
             raise
 
-    def store(self) -> None:
-        toml_file_setting = self.model_config.get("toml_file")
+    @classmethod
+    def _configured_toml_file(cls) -> Path:
+        toml_file_setting = cls.model_config.get("toml_file")
         if isinstance(toml_file_setting, Path):
-            toml_file = toml_file_setting
-        elif isinstance(toml_file_setting, str):
-            toml_file = Path(toml_file_setting)
-        else:
-            raise TypeError("Settings model_config.toml_file must identify exactly one file")
-        toml_file.parent.mkdir(parents=True, exist_ok=True)
+            return toml_file_setting
+        if isinstance(toml_file_setting, str):
+            return Path(toml_file_setting)
+        raise TypeError("Settings model_config.toml_file must identify exactly one file")
 
+    def _purge_loaded_keyring_references(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        remaining: list[str] = []
+        unverifiable: list[str] = []
+        for account_name, role in sorted(self.loaded_keyring_references):
+            entry = f"{account_name}:{role}"
+            try:
+                status = keyring_store.delete_secret_checked(account_name, role)
+            except Exception:
+                unverifiable.append(entry)
+                continue
+            if status == "present":
+                remaining.append(entry)
+            elif status == "unverifiable":
+                unverifiable.append(entry)
+        return tuple(remaining), tuple(unverifiable)
+
+    def _store_locked(
+        self,
+        toml_file: Path,
+        _durable_bootstrap: Bootstrap,
+        *,
+        purge_loaded_keyring_references: bool = False,
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
         effective = self.effective_credential_storage  # raw literal; never probes
         auto_probe_usable = effective == "auto" and keyring_store.keyring_usable()
         use_keyring = effective == "keyring" or auto_probe_usable
@@ -727,9 +813,53 @@ class Settings(BaseSettings):
         persisted_storage = effective if self._credential_storage_override is not None else self.credential_storage
         content = self._to_toml(use_keyring=use_keyring, credential_storage=persisted_storage)
         self._write_toml(toml_file, content)
+        cleanup = self._purge_loaded_keyring_references() if purge_loaded_keyring_references else ((), ())
         if self._credential_storage_override is not None:
             self.credential_storage = effective
         logger.info(f"Settings stored in {toml_file} ({'keyring' if use_keyring else 'plaintext'})")
+        return cleanup
+
+    @classmethod
+    def migrate_credentials(
+        cls,
+        target: Literal["keyring", "plaintext"],
+    ) -> tuple[Settings, tuple[str, ...], tuple[str, ...]]:
+        """Load, persist, and clean one stored legacy credential migration under one lock."""
+        toml_file = cls._configured_toml_file()
+        assert_legacy_writable("migrate legacy credentials", toml_file)
+        toml_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with bootstrap_file_lock(toml_file, require_secure_parent=False):
+            durable_bootstrap = _materialize_bootstrap_locked(read_bootstrap(toml_file))
+            try:
+                settings = cls.load_for_migration()
+            except Exception as exc:
+                raise LegacyCredentialMigrationLoadError from exc
+            settings.credential_storage = target
+            settings._credential_storage_override = target
+            try:
+                remaining, unverifiable = settings._store_locked(
+                    toml_file,
+                    durable_bootstrap,
+                    purge_loaded_keyring_references=target == "plaintext",
+                )
+            except Exception as exc:
+                raise LegacyCredentialMigrationStoreError from exc
+        return settings, remaining, unverifiable
+
+    def store(self) -> None:
+        # Sink-level fence: reject before mkdir, keyring probe, or serialization.
+        toml_file = self._configured_toml_file()
+        assert_legacy_writable("write legacy settings", toml_file)
+        # Keep a newly created immediate parent suitable for a later managed
+        # catalog without changing permissions on an existing legacy directory.
+        toml_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+        # The shared source/sidecar lock covers keyring effects, the legacy TOML
+        # commit, and any migration cleanup as one logical operation. Re-read durable
+        # authority before any secret effect.
+        with bootstrap_file_lock(toml_file, require_secure_parent=False):
+            durable_bootstrap = _materialize_bootstrap_locked(read_bootstrap(toml_file))
+            self._store_locked(toml_file, durable_bootstrap)
 
 
 _settings = None
@@ -738,8 +868,19 @@ _settings = None
 def get_settings(reload: bool = False) -> Settings:
     global _settings
     if not _settings or reload:
-        logger.info(f"Loading settings from {CONFIG_PATH}")
-        _settings = Settings()
+        bootstrap = process_bootstrap(CONFIG_PATH)
+        logger.info(f"Loading {bootstrap.mode} settings from {CONFIG_PATH}")
+        if bootstrap.mode == "managed":
+            if bootstrap.db_path is None:
+                raise ValueError("Managed mode requires a database path")
+            # Imported lazily to keep bootstrap parsing independent and to avoid
+            # constructing Settings(), which would parse legacy rows and overlays.
+            from mcp_email_server.managed import ManagedCatalog
+
+            loaded = ManagedCatalog(bootstrap.db_path).load_settings()
+        else:
+            loaded = Settings()
+        _settings = loaded
     return _settings
 
 
@@ -776,16 +917,14 @@ def _reset_cleanup_mode(raw: dict[str, Any]) -> CredentialStorage:
     return toml_mode if isinstance(toml_mode, str) and _is_credential_storage_mode(toml_mode) else "auto"
 
 
-def _cleanup_keyring_entries_for_reset() -> None:
-    """Best-effort keyring cleanup for delete_settings(); must never raise.
+def _cleanup_keyring_entries_for_reset(raw: dict[str, Any]) -> None:
+    """Best-effort keyring cleanup after the reset file commit; must never raise.
 
-    Deliberately does NOT construct Settings(): that would hard-fail on sentinel
-    resolution exactly when the user's keyring is broken (the scenario `reset` is
-    the escape hatch for) and would trigger unwanted side effects (env-account
-    injection, env overrides). Parses the raw TOML instead.
+    The caller parses the raw TOML before removing legacy state. This deliberately
+    does not construct Settings, which could fail on the broken keyring that reset
+    is intended to escape or compose environment-only accounts.
     """
     try:
-        raw = tomllib.loads(CONFIG_PATH.read_text())
         if _reset_cleanup_mode(raw) == "plaintext":
             return
         for email in raw.get("emails", []):
@@ -808,9 +947,27 @@ def _cleanup_keyring_entries_for_reset() -> None:
 
 
 def delete_settings() -> None:
-    if not CONFIG_PATH.exists():
+    # Sink-level fence: reject before keyring cleanup or unlink.
+    assert_legacy_writable("reset legacy settings", CONFIG_PATH)
+    # A fresh reset linearizes before any later writer and should leave no
+    # directory or pseudo-lock artifact. Do not treat a dangling symlink as absent.
+    if not CONFIG_PATH.exists() and not CONFIG_PATH.is_symlink():
         logger.info(f"Settings file {CONFIG_PATH} does not exist")
         return
-    _cleanup_keyring_entries_for_reset()
-    CONFIG_PATH.unlink()
-    logger.info(f"Deleted settings file {CONFIG_PATH}")
+    with bootstrap_file_lock(CONFIG_PATH, require_secure_parent=False):
+        durable = _materialize_bootstrap_locked(read_bootstrap(CONFIG_PATH))
+        if not CONFIG_PATH.exists():
+            logger.info(f"Settings file {CONFIG_PATH} does not exist")
+            return
+        raw = tomllib.loads(CONFIG_PATH.read_text())
+        CONFIG_PATH.unlink()
+        message = (
+            "Deleted legacy settings while preserving managed selection in its private sidecar"
+            if durable.db_path is not None
+            else f"Deleted settings file {CONFIG_PATH}"
+        )
+        # Commit removal first: a failed unlink/replace must not leave an old
+        # sentinel file after its referenced secret was deleted. Keep cleanup
+        # inside the same transaction so no writer can reuse an entry mid-purge.
+        _cleanup_keyring_entries_for_reset(raw)
+        logger.info(message)

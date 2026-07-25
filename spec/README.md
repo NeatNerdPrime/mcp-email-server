@@ -1,251 +1,154 @@
-# Local Email App Architecture
+# Local Email App Specifications
 
-Status: Proposed
+This directory defines the normative product and architecture contract for the
+Local Email App. The documents are organized by domain and design ownership.
+They describe the intended behavior and acceptance conditions; they do not claim
+that a requirement is implemented merely because it appears here.
 
-This directory defines the target architecture for evolving `mcp-email-server`
-into a local, single-user Email App. The application exposes email workflows to
-MCP clients over stdio and exposes account, credential, index, cache, and
-diagnostic management through a CLI.
+User-facing behavior belongs under [`docs/`](../docs/). Implementation plans,
+research notes, migration diaries, and test logs do not belong in these specs.
 
-These documents are design proposals. Current behavior remains defined by the
-code, tests, and published documentation under [`docs/`](../docs/).
+## Product Definition
 
-## Product Decisions
+The Local Email App connects one operating-system user on one machine to existing
+IMAP and SMTP accounts. It exposes mail workflows to MCP clients and provides a
+local management plane through CLI and an authenticated loopback Web UI.
 
-The following decisions apply to every detailed spec:
+The product has two explicit configuration modes:
 
-- The product is local and single-user.
-- stdio is the only target MCP transport.
-- MCP and CLI are peer adapters over the same application services.
-- SQLite is the managed local store for non-secret account configuration,
-  source-mapped operational account identities, mailbox and message metadata,
-  search indexes, sync cursors, operation evidence, and bounded body cache.
-- IMAP remains authoritative for mailbox state; SQLite is a local view, not a
-  replacement mail server.
-- Passwords, OAuth tokens, and provider API keys do not appear in ordinary
-  SQLite tables. A `SecretStore` owns secret values and SQLite stores only
-  opaque references.
-- Existing TOML, environment-variable, and keyring behavior remains available
-  as a compatibility mode and explicit import source.
-- MCP tools use progressive disclosure: account and metadata discovery precede
-  bounded body and attachment retrieval.
-- Static tools plus complete text results form the cross-client compatibility
-  baseline. Resources, prompts, structured output, and change notifications are
-  optional enhancements.
+- **legacy** preserves the existing TOML, environment-composition, and legacy
+  credential behavior;
+- **managed** uses SQLite as the authority for non-secret configuration and a
+  `SecretStore` as the authority for credentials.
 
-## Explicit Non-goals
+IMAP remains authoritative for mailbox membership, message placement, metadata,
+and flags. SMTP responses remain authoritative for delivery evidence. SQLite
+contains local authority only where explicitly stated and otherwise contains
+bounded, rebuildable observations.
 
-The proposal does not design:
+## Domain Map
 
-- Streamable HTTP, SSE, or any other remote MCP transport;
-- a hosted service, tenant model, remote authentication, or cloud secret store;
-- a profile daemon or implicit background synchronization service;
-- a web application or MCP App user interface;
-- a database portability framework or interchangeable SQL engines;
-- full offline mailbox replication;
-- persistent raw MIME or attachment payloads by default.
+| Spec                                                                                                   | Owning concern                                                                                |
+| ------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------- |
+| [`01-system-context.md`](01-system-context.md)                                                         | actors, scope, process model, trust boundaries, and global invariants                         |
+| [`02-domain-model-and-authority.md`](02-domain-model-and-authority.md)                                 | domain language, identities, sources of truth, revisions, and policy ownership                |
+| [`03-application-architecture.md`](03-application-architecture.md)                                     | layers, services, ports, composition, request boundaries, and resource lifecycle              |
+| [`04-configuration-and-managed-catalog.md`](04-configuration-and-managed-catalog.md)                   | bootstrap, legacy/managed selection, catalog authority, account lifecycle, policy, and import |
+| [`05-credentials-and-secret-lifecycle.md`](05-credentials-and-secret-lifecycle.md)                     | secret authority, late resolution, candidate rotation, removal, cleanup, and redaction        |
+| [`06-mail-read-model-and-metadata-index.md`](06-mail-read-model-and-metadata-index.md)                 | mailbox discovery, metadata projection, coverage, provider fallback, bodies, and attachments  |
+| [`07-mail-mutations-and-provider-effects.md`](07-mail-mutations-and-provider-effects.md)               | mark, append, move, archive, delete, SMTP, sent-copy, cancellation, and uncertain outcomes    |
+| [`08-sqlite-persistence-and-filesystem-security.md`](08-sqlite-persistence-and-filesystem-security.md) | logical schema, transactions, migrations, exact ownership, WAL, permissions, and retention    |
+| [`09-local-management-ui.md`](09-local-management-ui.md)                                               | React UI scope, loopback server, bootstrap/session security, concurrency, and packaging       |
+| [`10-mcp-interface-and-compatibility.md`](10-mcp-interface-and-compatibility.md)                       | stdio baseline, mail-only catalog, schemas, compatibility, bounds, and errors                 |
+| [`11-agent-integration-and-safe-setup.md`](11-agent-integration-and-safe-setup.md)                     | Codex/Claude Code integration, safe CLI/UI handoff, installation, and no-secret agent rules   |
+| [`12-delivery-validation-and-evolution.md`](12-delivery-validation-and-evolution.md)                   | verification map, test layers, package/release gates, documentation, and future change rules  |
 
-The application core must not import FastMCP, which keeps an additional adapter
-possible in principle, but no abstraction may be added solely for a hypothetical
-HTTP or cloud deployment.
-
-## Spec Map
-
-1. [`01-system-context.md`](01-system-context.md) — product boundary, local
-   process model, actors, goals, non-goals, and runtime ownership.
-2. [`02-application-boundaries.md`](02-application-boundaries.md) — domain,
-   application services, ports, adapters, composition, and dependency rules.
-3. [`03-configuration-and-credentials.md`](03-configuration-and-credentials.md)
-   — managed configuration, legacy compatibility, runtime overlays, secret
-   backends, and CLI management contracts.
-4. [`04-mail-workflows-and-consistency.md`](04-mail-workflows-and-consistency.md)
-   — metadata refresh, search, body retrieval, send, mutation, retry, and local
-   reconciliation semantics.
-5. [`05-sqlite-persistence-and-data-model.md`](05-sqlite-persistence-and-data-model.md)
-   — SQLite ownership, logical schema, search indexes, transactions, retention,
-   migrations, and recovery.
-6. [`06-mcp-interface-and-client-compatibility.md`](06-mcp-interface-and-client-compatibility.md)
-   — MCP tool design, progressive disclosure, client capability evidence,
-   output compatibility, annotations, and stdio validation.
-
-There is intentionally no phased migration plan. Each implementation change
-must preserve or explicitly version current public behavior, but sequencing
-belongs in issues and pull requests rather than in the architecture contract.
-
-## Architecture Shape
-
-```mermaid
-flowchart LR
-    USER[Local user]
-    CLIENT[MCP client]
-    SHELL[Shell]
-    MCP[MCP stdio adapter]
-    CLI[Management CLI]
-    APP[Application services]
-    DB[(SQLite)]
-    SECRET[SecretStore]
-    IMAP[IMAP server]
-    SMTP[SMTP server]
-    FILES[Private artifact workspace]
-
-    USER --> CLIENT
-    USER --> SHELL
-    CLIENT --> MCP
-    SHELL --> CLI
-    MCP --> APP
-    CLI --> APP
-    APP --> DB
-    APP --> SECRET
-    APP --> IMAP
-    APP --> SMTP
-    APP --> FILES
-```
-
-MCP owns agent-facing mail workflows. CLI owns local management workflows,
-including secret input. Neither interface owns mail policy, persistence rules,
-or protocol clients.
+Cross-references point to the owning document rather than duplicating its full
+contract. This README is the only ordered navigation map.
 
 ## Sources of Truth
 
-| Data class                   | Source of truth                      | SQLite role                                                                                              |
-| ---------------------------- | ------------------------------------ | -------------------------------------------------------------------------------------------------------- |
-| Managed configuration        | SQLite                               | Authoritative non-secret accounts, policies, and rules                                                   |
-| Legacy account configuration | TOML compatibility adapter           | Base config stays in TOML; SQLite stores only non-secret source-to-operational-ID mapping and index data |
-| Environment overrides        | Process environment                  | Read-only runtime config; SQLite may retain only non-secret source identity and index data               |
-| Passwords and tokens         | Selected `SecretStore`               | Opaque backend and locator only                                                                          |
-| Mailbox and message state    | IMAP server                          | Rebuildable, freshness-qualified last-observed projection and cache                                      |
-| SMTP delivery acceptance     | SMTP server response                 | Operation evidence and reconciliation state                                                              |
-| Raw MIME and attachments     | IMAP server or explicit local export | Metadata only by default                                                                                 |
-
-## Dependency Direction
-
-```mermaid
-graph TD
-    MCP[MCP interface]
-    CLI[CLI interface]
-    APP[Application services]
-    DOMAIN[Domain models and policies]
-    PORTS[Application ports]
-    SQLITE[SQLite adapters]
-    LEGACY[Legacy config adapters]
-    SECRETS[Secret adapters]
-    MAIL[IMAP, SMTP, and MIME adapters]
-    ARTIFACTS[Local artifact adapter]
-
-    MCP --> APP
-    CLI --> APP
-    APP --> DOMAIN
-    APP --> PORTS
-    SQLITE -. implements .-> PORTS
-    LEGACY -. implements .-> PORTS
-    SECRETS -. implements .-> PORTS
-    MAIL -. implements .-> PORTS
-    ARTIFACTS -. implements .-> PORTS
-```
-
-Outer adapters depend on application contracts. Domain and application code do
-not import FastMCP, Typer, sqlite3, keyring, aioimaplib, or aiosmtplib.
+| Information                                        | Authority                   | Other local representations                         |
+| -------------------------------------------------- | --------------------------- | --------------------------------------------------- |
+| selected mode and managed database path            | bootstrap configuration     | process-frozen startup snapshot                     |
+| managed non-secret accounts and policy             | managed SQLite catalog      | immutable operation snapshots                       |
+| managed secret values                              | `SecretStore`               | no value cache or ordinary SQLite field             |
+| managed secret binding state                       | managed SQLite catalog      | bounded status DTOs without locators                |
+| legacy stored accounts and global policy           | legacy TOML                 | environment-composited runtime view in legacy mode  |
+| environment-defined accounts and overrides         | current process environment | legacy effective snapshot only                      |
+| mailbox membership, placement, metadata, and flags | IMAP                        | bounded SQLite observation                          |
+| message delivery                                   | SMTP protocol evidence      | typed delivery outcome                              |
+| sent-copy placement                                | IMAP APPEND evidence        | typed secondary outcome and stale projection marker |
+| UI authentication/session state                    | current UI process memory   | secure cookie and one-time bootstrap token          |
 
 ## Cross-cutting Invariants
 
-- Tool and CLI handlers map inputs and outputs; they do not implement email
-  policy or database transactions.
-- One application command or query owns each user action.
-- Network calls and secret-store calls never run inside SQLite transactions.
-- A message placement is identified by account, mailbox, UIDVALIDITY, and UID;
-  an IMAP UID alone is not durable.
-- An indexed placement is a timestamped observation, not proof of current remote
-  existence. IMAP remains authoritative for mailbox membership.
-- Absence proves removal only from matching-UIDVALIDITY `VANISHED` or equivalent
-  provider evidence, a confirmed local mutation, or a complete UID-set
-  reconciliation. Partial refresh never deletes by absence.
-- A message-scoped delete or move fallback never issues bare mailbox-wide
-  `EXPUNGE`; without UID EXPUNGE or another proven scoped primitive it returns a
-  non-expunged partial outcome or rejects hard deletion according to policy.
-- Remote disappearance removes a placement, not necessarily the logical message;
-  when no active placement remains, cached body and body-derived FTS content are
-  purged by default and no implicit deleted-mail archive is exposed.
-- SMTP results preserve per-recipient acceptance, rejection, and uncertainty;
-  accepted or unknown recipients are never automatically resubmitted.
-- SMTP success is not rolled back when saving the sent copy fails, and an unknown
-  sent-copy APPEND is reconciled before retry.
-- Provider-effect operations atomically verify claim ownership and catalog
-  generation while persisting each effect boundary. Placement-scoped operations
-  also verify the expected active placement and UIDVALIDITY and advance the
-  mailbox revision before provider access; membership-affecting operations mark
-  source targets stale, while flag-only operations mark only the flag projection
-  stale, both with attempt ownership. Post-boundary stale claims become unknown
-  rather than being replayed.
-- Unknown operation evidence is never silently evicted. Rebuildable message
-  metadata may be compacted into bounded target evidence, but every unresolved
-  placement identity remains an enforceable effect-boundary fence. Mailbox IDs
-  referenced by unreleased fences survive full index rebuild or are rebound only
-  with identity evidence; rediscovery reconstructs operation-owned uncertainty
-  rather than enabling a competing mutation. Only reconciliation or explicit acknowledgment releases the fence.
-  Exhausted evidence capacity blocks new provider-effect mutations without
-  inventing an outcome or allowing replay.
-- A `CONFIRMED` flag projection contains one canonical, complete provider-observed
-  flag set. A requested flag delta or prior cache plus delta never proves the
-  resulting set when another client could have changed unrelated flags.
-- Finite operation-evidence byte and unresolved-count ceilings apply in managed,
-  legacy, and environment-only modes; later policy sources may tighten but never
-  widen the bootstrap safety ceiling.
-- Body reads use IMAP PEEK unless the user explicitly requests a read mutation.
-- Legacy and environment accounts may reuse stable SQLite operational identities,
-  but their endpoints, policies, and secrets are never copied into managed
-  configuration by index activity or an unrelated save.
-- Secrets never appear in tool results, structured logs, database rows, or
-  migration diagnostics.
-- Managed credential changes use a persisted saga and a unique candidate locator;
-  they never overwrite or delete the currently committed secret in place.
-- Account removal keeps a tombstone and operational identity while credential
-  cleanup or operation evidence remains; hard purge explicitly deletes eligible
-  children before releasing the name.
-- An active managed catalog materializes every required global security rule set;
-  missing or invalid sets fail closed. Rule sets distinguish inherit,
-  unrestricted, and explicit empty restriction; durable denies win and account
-  rules cannot widen global authority, apart from documented process-local
-  compatibility replacements.
-- The tool catalog is stable for the life of a stdio session. Account capability
-  changes are represented as data and call-time validation, not tool replacement.
-- Every list, body, error, and artifact operation has an explicit size bound.
+1. A persisted managed selection never falls back to legacy automatically.
+2. The selected mode is frozen for a process. Changing it requires restart.
+3. Account and policy authority is revalidated before each independent provider
+   effect.
+4. Managed credentials are resolved only for the selected account and required
+   endpoint role, immediately before provider construction. Secret values do not
+   enter application DTOs, process-wide settings caches, SQLite, any MCP input or
+   result, agent chat/skill state, URLs, logs, diagnostics, or browser storage.
+5. Network, `SecretStore`, and large filesystem operations never run inside a
+   SQLite transaction.
+6. A durable IMAP placement identity includes operational account, mailbox,
+   UIDVALIDITY, and UID. The existing public numeric email ID is a compatibility
+   identifier, not proof of the listing epoch.
+7. Partial observation never proves provider deletion by absence.
+8. Body reads use PEEK unless the caller explicitly requests a separate read
+   mutation.
+9. Scoped delete and move fallback never issue mailbox-wide bare `EXPUNGE`.
+10. An ambiguous provider effect is reported as unknown and is never
+    automatically replayed.
+11. SMTP delivery and sent-copy APPEND are separate effects; sent-copy failure
+    never causes SMTP resubmission.
+12. Public requests, provider work after cardinality is known, local work,
+    serialized results, and error details have explicit bounds. Basic IMAP
+    SEARCH's pre-cardinality UID response is the sole documented provider-payload
+    residual and is constrained by a command deadline plus a strict
+    post-response candidate ceiling.
+13. The stdio tool catalog remains stable for the life of a process; current
+    authority and capability are enforced at call time.
+14. Attachment materialization preserves the caller's exact requested
+    destination for compatibility, but only after explicit enablement, fresh
+    policy validation, bounded fetch, and no-follow filesystem checks.
+15. The local Web UI binds only to `127.0.0.1`, uses an ephemeral port by
+    default, has no share/remote mode, and treats every browser request as
+    untrusted until authenticated and CSRF-validated.
+16. MCP exposes no account or credential management. Optional agent skills hand
+    users off to interactive CLI/UI and never collect or relay credentials.
 
-## Current Implementation Relationship
+## Product Surfaces
 
-The current repository already provides stdio, mail workflows, TOML/environment
-composition, keyring support, and bounded body reads. It does not yet provide
-the architecture described here:
+| Surface               | Responsibility                                                                   |
+| --------------------- | -------------------------------------------------------------------------------- |
+| MCP stdio             | bounded mail discovery and mail workflows; no account management or secret entry |
+| CLI                   | complete headless management, recovery, automation, and safe secret input        |
+| Local Web UI          | complete graphical management plane; no mailbox reader or composer               |
+| Agent skill/plugin    | optional local MCP packaging plus non-secret discovery and CLI/UI handoff        |
+| SSE / Streamable HTTP | retained compatibility commands, not the target managed architecture             |
+| MCP Apps              | not part of this delivery; requires a separate accepted proposal                 |
 
-- `mcp_email_server/app.py` currently combines MCP registration, settings access,
-  policy checks, handler dispatch, and response mapping.
-- `mcp_email_server/config.py` currently combines stored configuration, runtime
-  composition, resolved secrets, mutation, and a process-global cache.
-- `db_location` exists, but no operational SQLite repository currently uses it.
-- conditional tool visibility filters `tools/list` but does not notify clients
-  when the list changes.
-- the published `sse`, `streamable-http`, and Gradio `ui` commands remain legacy
-  compatibility entry points; they are not part of the proposed runtime and
-  require a separate versioned decision before removal or redirection.
+The existing public `mcp-email-server ui` command remains the graphical entry
+point and is replaced in place by the embedded local React UI. There is no new
+`webui` command and no daemon.
 
-Those statements describe the starting point, not a delivery sequence.
+## Scope
 
-## Status Vocabulary
+The delivery governed by these specs includes:
 
-| Status        | Meaning                                                     |
-| ------------- | ----------------------------------------------------------- |
-| `Proposed`    | Under discussion; no implementation claim is made.          |
-| `Accepted`    | Approved target; implementation may be incomplete.          |
-| `Implemented` | Backed by code, tests, and aligned published documentation. |
-| `Superseded`  | Replaced by a linked decision or spec.                      |
+- immediate managed initialization for fresh installs, v1-safe reviewed migration, selection, and diagnostics;
+- account create/read/update/disable/re-enable/soft-remove;
+- managed policy and credential lifecycle;
+- preview-first, explicit legacy import;
+- shared application services for CLI, Web UI, and MCP adapters;
+- bounded mailbox, metadata, body, attachment, and mutation workflows;
+- a bounded metadata projection in SQLite;
+- an authenticated loopback management UI packaged inside Python artifacts;
+- a repository-distributed Codex/Claude Code integration that guides safe setup
+  without accepting credentials;
+- removal of the historical secret-bearing MCP account-add tool with migration
+  guidance to interactive CLI/UI;
+- complete contract, security, package, and GreenMail validation.
 
-## Research Basis
+It does not include:
 
-The MCP interface design was checked on 2026-07-18 against the stable
-[MCP 2025-11-25 specification](https://modelcontextprotocol.io/specification/2025-11-25)
-and current official documentation for
-[VS Code](https://code.visualstudio.com/api/extension-guides/ai/mcp),
-[Cursor](https://cursor.com/docs/mcp),
-[Claude Code](https://code.claude.com/docs/en/mcp), and
-[OpenAI Codex](https://developers.openai.com/codex/mcp).
-Detailed, claim-specific links are kept in
-[`06-mcp-interface-and-client-compatibility.md`](06-mcp-interface-and-client-compatibility.md).
+- hosted or multi-user service behavior;
+- a daemon or background synchronizer;
+- a remotely supported management API;
+- MCP Apps;
+- full offline mail replication;
+- FTS, persistent bodies, raw MIME, or attachment payload storage;
+- QRESYNC/VANISHED optimization;
+- generic operation journals, leases, evidence ledgers, or continuity systems;
+- online backup/restore or hard purge;
+- exactly-once guarantees for ambiguous IMAP or SMTP effects.
+
+## Specification Language
+
+`MUST`, `MUST NOT`, `SHOULD`, and `MAY` are normative. Each detailed document
+ends with acceptance criteria. Verification evidence is centralized in
+[`12-delivery-validation-and-evolution.md`](12-delivery-validation-and-evolution.md),
+so specs remain stable contracts instead of implementation logs.

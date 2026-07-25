@@ -8,21 +8,43 @@ import re
 import ssl
 import time
 import unicodedata
+from contextlib import suppress
 from datetime import UTC, datetime
+from email import encoders
 from email.header import Header
 from email.message import Message
-from email.mime.application import MIMEApplication
+from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.parser import BytesParser
+from email.policy import SMTP as SMTP_POLICY
+from email.policy import SMTPUTF8 as SMTPUTF8_POLICY
 from email.policy import default
 from pathlib import Path
 from typing import Any, cast
 
 import aioimaplib
 import aiosmtplib
+from aiosmtplib.errors import SMTPNotSupported, SMTPRecipientRefused, SMTPResponseException
 from bs4 import BeautifulSoup
 
+from mcp_email_server.application.limits import APPLICATION_LIMITS, validate_imap_uid
+from mcp_email_server.application.metadata import (
+    MAX_METADATA_SNAPSHOT_ROWS,
+    MailboxMetadataSnapshot,
+    MailboxState,
+    MetadataProviderObservationError,
+    MetadataQueryTooBroadError,
+)
+from mcp_email_server.application.mutations import (
+    AppendMutationOutcome,
+    BatchMutationOutcome,
+    DeliveryMutationOutcome,
+    MutationStatus,
+    SentCopyMutationOutcome,
+    TargetMutationOutcome,
+    validate_mailbox_name,
+)
 from mcp_email_server.config import EmailServer, EmailSettings, get_settings, sender_allowed
 from mcp_email_server.emails import EmailHandler
 from mcp_email_server.emails.models import (
@@ -37,6 +59,44 @@ from mcp_email_server.log import logger
 
 # Maximum body length before truncation (characters)
 MAX_BODY_LENGTH = 20000
+MAX_METADATA_CANDIDATES = APPLICATION_LIMITS.metadata_candidates
+MAX_INDEXED_UID_WINDOW = MAX_METADATA_SNAPSHOT_ROWS
+MAX_METADATA_HEADER_BYTES = APPLICATION_LIMITS.header_bytes
+MAX_METADATA_HEADER_TOTAL_BYTES = APPLICATION_LIMITS.aggregate_header_bytes
+MAX_METADATA_HEADER_FETCH_UIDS = MAX_METADATA_HEADER_TOTAL_BYTES // (MAX_METADATA_HEADER_BYTES + 1)
+MAX_IMAP_UID = 2**32 - 1
+MAX_METADATA_UID_SEARCH_BYTES = MAX_METADATA_CANDIDATES * 11
+MAX_ATTACHMENT_BYTES = APPLICATION_LIMITS.attachment_bytes
+MAX_TOTAL_ATTACHMENT_BYTES = APPLICATION_LIMITS.total_attachment_bytes
+MAX_RAW_EMAIL_BYTES = MAX_TOTAL_ATTACHMENT_BYTES
+
+
+class MetadataPayloadTooLargeError(ValueError):
+    """Provider-controlled headers exceeded the bounded metadata budget."""
+
+
+class ImapAuthenticationError(ConnectionError):
+    """An IMAP server rejected authentication without exposing provider detail."""
+
+
+class ImapTransportError(ConnectionError):
+    """An IMAP login failed at the transport boundary."""
+
+
+class _MetadataHeaderBudget:
+    def __init__(self) -> None:
+        self.total_bytes = 0
+
+    def add(self, raw_headers: bytes) -> None:
+        if len(raw_headers) > MAX_METADATA_HEADER_BYTES:
+            raise MetadataPayloadTooLargeError("provider_payload_too_large: metadata header exceeds 64 KiB")
+        self.total_bytes += len(raw_headers)
+        if self.total_bytes > MAX_METADATA_HEADER_TOTAL_BYTES:
+            raise MetadataPayloadTooLargeError("provider_payload_too_large: metadata header query exceeds 4 MiB")
+
+
+# aioimaplib's protocol-level CAPABILITY command has no built-in timeout.
+_IMAP_CAPABILITY_TIMEOUT_SECONDS = 30.0
 
 # Common Archive folder names, used as a fallback when no RFC 6154 \Archive flag is found.
 _ARCHIVE_FOLDER_CANDIDATES = ("Archive", "Archives", "[Gmail]/All Mail")
@@ -44,6 +104,13 @@ _ARCHIVE_FOLDER_CANDIDATES = ("Archive", "Archives", "[Gmail]/All Mail")
 
 # RFC 3501 system flags (except \Recent which is read-only) + custom keyword atoms
 _VALID_IMAP_FLAG = re.compile(r"^\\[A-Za-z]+$|^[A-Za-z][A-Za-z0-9_-]*$")
+
+
+def _validate_imap_uids(email_ids: list[str]) -> None:
+    """Reject non-canonical UIDs before any low-level IMAP operation."""
+
+    for email_id in email_ids:
+        validate_imap_uid(email_id)
 
 
 def _validate_flags(flags: list[str]) -> str:
@@ -230,52 +297,94 @@ def _quote_mailbox(mailbox: str) -> str:
 
 
 def _uid_sort_key(uid: bytes | str) -> int:
-    """Return a numeric sort key for IMAP UIDs."""
+    """Return a numeric sort key for already validated IMAP UIDs."""
     value = uid.decode() if isinstance(uid, bytes) else uid
     return int(value)
 
 
+def _normalize_search_uids(messages: Any) -> list[str]:  # noqa: C901 - bounded provider UID validation
+    """Return canonical single UIDs from one bounded UID SEARCH payload."""
+    if not isinstance(messages, list | tuple) or not messages or not messages[0]:
+        return []
+    # aioimaplib places the UID SEARCH payload first and may retain a tagged
+    # completion line in later response elements. Only the first element is a
+    # UID set under this adapter contract.
+    payload = messages[0]
+    if isinstance(payload, bytes):
+        if len(payload) > MAX_METADATA_UID_SEARCH_BYTES:
+            raise MetadataQueryTooBroadError(
+                f"query_too_broad: metadata search exceeded {MAX_METADATA_CANDIDATES} candidate UIDs"
+            )
+        try:
+            text = payload.decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise MetadataProviderObservationError("Provider returned invalid UID search results") from exc
+    elif isinstance(payload, str):
+        if len(payload.encode("utf-8")) > MAX_METADATA_UID_SEARCH_BYTES:
+            raise MetadataQueryTooBroadError(
+                f"query_too_broad: metadata search exceeded {MAX_METADATA_CANDIDATES} candidate UIDs"
+            )
+        text = payload
+    else:
+        raise MetadataProviderObservationError("Provider returned invalid UID search results")
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for token in text.split():
+        if re.fullmatch(r"[1-9][0-9]*", token) is None:
+            raise MetadataProviderObservationError("Provider returned invalid UID search results")
+        value = int(token)
+        if value > MAX_IMAP_UID or str(value) != token or token in seen:
+            raise MetadataProviderObservationError("Provider returned invalid UID search results")
+        seen.add(token)
+        result.append(token)
+    if len(result) > MAX_METADATA_CANDIDATES:
+        raise MetadataQueryTooBroadError(
+            f"query_too_broad: metadata search exceeded {MAX_METADATA_CANDIDATES} candidate UIDs"
+        )
+    return result
+
+
 def _imap_status(response: Any) -> str:
-    """Return the normalized status from an aioimaplib response."""
+    """Return a short normalized status without exposing provider text."""
     if hasattr(response, "result"):
-        return str(response.result).upper()
-    if isinstance(response, tuple) and response:
-        return str(response[0]).upper()
-    return str(response).upper()
+        raw_status = response.result
+    elif isinstance(response, tuple) and response:
+        raw_status = response[0]
+    else:
+        raw_status = response
+    status = str(raw_status)[:16].upper()
+    return status if status in {"OK", "NO", "BAD", "BYE", "PREAUTH"} else "UNKNOWN"
 
 
-def _format_imap_response_detail(response: Any) -> str:
-    """Return a compact, readable IMAP response detail string."""
+def _imap_effect_status(response: Any) -> MutationStatus:
+    """Classify post-command evidence without treating disconnects as rejection."""
     status = _imap_status(response)
-    lines = getattr(response, "lines", None)
-    if lines is None and isinstance(response, tuple) and len(response) > 1:
-        lines = response[1]
+    if status == "OK":
+        return "succeeded"
+    if status in {"NO", "BAD"}:
+        return "failed"
+    return "unknown"
 
-    detail_parts = []
-    for line in lines or []:
-        if isinstance(line, bytes):
-            detail_parts.append(line.decode("utf-8", errors="replace"))
-        else:
-            detail_parts.append(str(line))
 
-    detail = " ".join(part for part in detail_parts if part).strip()
-    return f"{status} {detail}".strip()
+async def _best_effort_imap_logout(imap: Any) -> None:
+    """Close an IMAP session without replacing mutation evidence with cleanup failure."""
+    try:
+        await imap.logout()
+    except (asyncio.CancelledError, Exception):
+        logger.debug("IMAP logout failed")
 
 
 def _raise_for_imap_error(response: Any, operation: str) -> None:
-    """Raise when an IMAP command returns a non-OK status."""
-    if _imap_status(response) != "OK":
-        detail = _format_imap_response_detail(response)
-        msg = f"{operation} failed" + (f": {detail}" if detail else "")
-        raise RuntimeError(msg)
+    """Raise a bounded error when an IMAP command returns a non-OK status."""
+    status = _imap_status(response)
+    if status != "OK":
+        raise RuntimeError(f"{operation} failed ({status})")
 
 
 def _raise_for_imap_command_failure(response: Any, operation: str) -> None:
-    """Raise only when an IMAP command reports an explicit failure status."""
-    if _imap_status(response) in {"NO", "BAD"}:
-        detail = _format_imap_response_detail(response)
-        msg = f"{operation} failed" + (f": {detail}" if detail else "")
-        raise RuntimeError(msg)
+    """Require an authoritative IMAP command to return OK."""
+    _raise_for_imap_error(response, operation)
 
 
 def _decoded_payload(message: Message) -> bytes | None:
@@ -340,8 +449,10 @@ async def _send_imap_id(imap: aioimaplib.IMAP4 | aioimaplib.IMAP4_SSL) -> None:
                     '("name" "mcp-email-server" "version" "1.0.0")',
                 )
             )
-    except Exception as e:
-        logger.warning(f"IMAP ID command failed: {e!s}")
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.warning("IMAP ID command failed")
 
 
 async def _imap_login(
@@ -365,16 +476,16 @@ async def _imap_login(
     real error and back off, and so a one-off auth failure does not cascade
     into a multi-minute lock-out.
     """
-    response = await imap.login(user_name, password)
-    if response.result == "OK":
+    try:
+        response = await imap.login(user_name, password)
+    except (asyncio.CancelledError, TimeoutError):
+        raise
+    except Exception:
+        raise ImapTransportError("IMAP login failed (TRANSPORT)") from None
+    status = _imap_status(response)
+    if status == "OK":
         return
-    detail = " ".join(
-        line.decode("utf-8", errors="replace") if isinstance(line, bytes) else str(line)
-        for line in (response.lines or [])
-    ).strip()
-    raise ConnectionError(
-        f"IMAP login failed for {user_name!r}: {response.result}" + (f" ({detail})" if detail else "")
-    )
+    raise ImapAuthenticationError(f"IMAP login failed ({status})")
 
 
 def _create_ssl_context(verify_ssl: bool) -> ssl.SSLContext | None:
@@ -400,14 +511,52 @@ def _create_starttls_ssl_context(verify_ssl: bool) -> ssl.SSLContext:
     return ctx
 
 
-def _imap_capabilities(imap: aioimaplib.IMAP4) -> set[str]:
-    """Return normalized capabilities from an aioimaplib protocol."""
+def _imap_capabilities(imap: aioimaplib.IMAP4 | aioimaplib.IMAP4_SSL) -> set[str]:
+    """Return normalized capabilities advertised by the connected IMAP protocol."""
+    protocol = imap.protocol
+    if protocol is None:
+        return set()
     return {
         capability.decode("utf-8", errors="replace").upper()
         if isinstance(capability, bytes)
         else str(capability).upper()
-        for capability in getattr(imap.protocol, "capabilities", ())
+        for capability in protocol.capabilities
     }
+
+
+async def _refresh_imap_capabilities(imap: aioimaplib.IMAP4 | aioimaplib.IMAP4_SSL) -> set[str]:
+    """Refresh and normalize the authoritative post-authentication capabilities.
+
+    aioimaplib checks its protocol capability set again before sending UID
+    EXPUNGE or MOVE. Persisting the same normalized snapshot used by our safety
+    checks prevents case or authentication-phase drift between those decisions.
+    """
+    protocol = imap.protocol
+    if protocol is None:
+        raise ConnectionError("IMAP protocol is not connected")
+    await asyncio.wait_for(protocol.capability(), timeout=_IMAP_CAPABILITY_TIMEOUT_SECONDS)
+    capabilities = _imap_capabilities(imap)
+    protocol.capabilities = capabilities
+    return capabilities
+
+
+def _supports_uid_expunge(imap: aioimaplib.IMAP4 | aioimaplib.IMAP4_SSL) -> bool:
+    """Return whether RFC 4315 target-scoped expunge is available."""
+    return "UIDPLUS" in _imap_capabilities(imap)
+
+
+async def _uid_expunge(
+    imap: aioimaplib.IMAP4 | aioimaplib.IMAP4_SSL,
+    email_ids: list[str],
+    operation: str,
+) -> None:
+    """Expunge exactly *email_ids*; never fall back to mailbox-wide EXPUNGE."""
+    if not email_ids:
+        return
+    if not _supports_uid_expunge(imap):
+        raise RuntimeError(f"{operation} requires the IMAP UIDPLUS capability for safe UID EXPUNGE")
+    response = await imap.uid("expunge", ",".join(email_ids))
+    _raise_for_imap_error(response, operation)
 
 
 async def _imap_starttls(imap: aioimaplib.IMAP4, ssl_context: ssl.SSLContext, host: str) -> None:
@@ -480,17 +629,35 @@ class EmailClient:
         return await self._prepare_imap_connection(imap, self.email_server)
 
     @staticmethod
+    async def _abort_imap_connection(imap: aioimaplib.IMAP4_SSL | aioimaplib.IMAP4) -> None:
+        """Close a connection that failed before ownership reached a caller."""
+        protocol = imap.protocol
+        if protocol is not None and protocol.transport is not None:
+            with suppress(Exception):
+                protocol.transport.close()
+        client_task = imap._client_task
+        if isinstance(client_task, asyncio.Future) and not client_task.done():
+            client_task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await client_task
+
+    @staticmethod
     async def _prepare_imap_connection(
         imap: aioimaplib.IMAP4_SSL | aioimaplib.IMAP4,
         server: EmailServer,
     ) -> aioimaplib.IMAP4_SSL | aioimaplib.IMAP4:
         """Wait for greeting and optionally STARTTLS-upgrade an IMAP connection."""
-        await imap._client_task
-        await imap.wait_hello_from_server()
+        try:
+            await imap._client_task
+            await imap.wait_hello_from_server()
 
-        if server.start_ssl:
-            ssl_context = _create_starttls_ssl_context(server.verify_ssl)
-            await _imap_starttls(imap, ssl_context, server.host)
+            if server.start_ssl:
+                ssl_context = _create_starttls_ssl_context(server.verify_ssl)
+                await _imap_starttls(imap, ssl_context, server.host)
+        except BaseException:
+            # Ownership has not reached the operation's normal logout guard yet.
+            await EmailClient._abort_imap_connection(imap)
+            raise
 
         return imap
 
@@ -756,37 +923,48 @@ class EmailClient:
                 "date": date,
                 "attachments": [],
             }
-        except Exception as e:
-            logger.error(f"Error parsing email headers: {e!s}")
+        except Exception:
+            logger.error("Error parsing email headers")
             return None
 
     async def _fetch_dates_chunk(
         self,
         imap: aioimaplib.IMAP4_SSL | aioimaplib.IMAP4,
-        chunk: list[bytes],
+        chunk: list[bytes] | list[str],
         chunk_num: int,
         total_chunks: int,
         timeout: float = 30.0,
     ) -> dict[str, datetime]:
         """Fetch INTERNALDATE for a single chunk of UIDs."""
-        uid_list = ",".join(uid.decode() for uid in chunk)
+        uid_list = ",".join(uid.decode() if isinstance(uid, bytes) else uid for uid in chunk)
         chunk_start = time.perf_counter()
-        _, data = await asyncio.wait_for(
+        response = await asyncio.wait_for(
             imap.uid("fetch", uid_list, "(INTERNALDATE)"),
             timeout=timeout,
         )
+        _raise_for_imap_command_failure(response, f"FETCH INTERNALDATE for {len(chunk)} UIDs")
+        _, data = response
         chunk_elapsed = time.perf_counter() - chunk_start
 
+        expected_uids = {uid.decode() if isinstance(uid, bytes) else uid for uid in chunk}
         chunk_dates: dict[str, datetime] = {}
         for item in data:
             if not isinstance(item, bytes) or b"INTERNALDATE" not in item:
                 continue
             uid_match = re.search(rb"UID (\d+)", item)
             date_match = re.search(rb'INTERNALDATE "([^"]+)"', item)
-            if uid_match and date_match:
-                uid = uid_match.group(1).decode()
-                date_str = date_match.group(1).decode().strip()
+            if uid_match is None or date_match is None:
+                raise MetadataProviderObservationError("Provider returned invalid INTERNALDATE metadata")
+            uid = uid_match.group(1).decode()
+            if uid not in expected_uids or uid in chunk_dates:
+                raise MetadataProviderObservationError("Provider returned invalid INTERNALDATE metadata")
+            try:
+                date_str = date_match.group(1).decode("ascii").strip()
                 chunk_dates[uid] = datetime.strptime(date_str, "%d-%b-%Y %H:%M:%S %z")
+            except (UnicodeDecodeError, ValueError) as exc:
+                raise MetadataProviderObservationError("Provider returned invalid INTERNALDATE metadata") from exc
+        if set(chunk_dates) != expected_uids:
+            raise MetadataProviderObservationError("Provider returned incomplete INTERNALDATE metadata")
 
         if total_chunks > 1:
             logger.info(f"Fetched dates chunk {chunk_num}/{total_chunks}: {len(chunk)} UIDs in {chunk_elapsed:.2f}s")
@@ -796,7 +974,7 @@ class EmailClient:
     async def _batch_fetch_dates(
         self,
         imap: aioimaplib.IMAP4_SSL | aioimaplib.IMAP4,
-        email_ids: list[bytes],
+        email_ids: list[bytes] | list[str],
         chunk_size: int = 500,
     ) -> dict[str, datetime]:
         """Batch fetch INTERNALDATE for all UIDs in sequential chunks.
@@ -821,43 +999,67 @@ class EmailClient:
 
         return uid_dates
 
-    async def _batch_fetch_headers(
+    async def _batch_fetch_headers(  # noqa: C901 - bounded provider response alternatives
         self,
         imap: aioimaplib.IMAP4_SSL | aioimaplib.IMAP4,
         email_ids: list[bytes] | list[str],
+        *,
+        include_flags: bool = False,
+        chunk_size: int = 100,
+        header_budget: _MetadataHeaderBudget | None = None,
     ) -> dict[str, dict[str, Any]]:
-        """Batch fetch headers for a list of UIDs."""
+        """Fetch bounded header chunks, optionally retaining canonical flags."""
         if not email_ids:
             return {}
 
-        # Normalize to list of strings
         str_ids = [uid.decode() if isinstance(uid, bytes) else uid for uid in email_ids]
-        uid_list = ",".join(str_ids)
-        _, data = await imap.uid("fetch", uid_list, "BODY.PEEK[HEADER]")
-
         results: dict[str, dict[str, Any]] = {}
-        for i, item in enumerate(data):
-            if not isinstance(item, bytes) or b"BODY[HEADER]" not in item:
-                continue
-            # First try to find UID in the same line (standard format)
-            uid_match = re.search(rb"UID (\d+)", item)
-            if uid_match and i + 1 < len(data) and isinstance(data[i + 1], bytearray):
-                uid = uid_match.group(1).decode()
-                raw_headers = bytes(data[i + 1])
-                metadata = self._parse_headers(uid, raw_headers)
-                if metadata:
-                    results[uid] = metadata
-            # Proton Bridge format: UID comes AFTER header data in a separate item
-            # Format: [i]=b'N FETCH (BODY[HEADER] {size}', [i+1]=bytearray(headers), [i+2]=b' UID xxx)'
-            elif i + 2 < len(data) and isinstance(data[i + 1], bytearray):
-                uid_after_match = re.search(rb"UID (\d+)", data[i + 2]) if isinstance(data[i + 2], bytes) else None
-                if uid_after_match:
+        budget = header_budget or _MetadataHeaderBudget()
+        partial = f"<0.{MAX_METADATA_HEADER_BYTES + 1}>"
+        fetch_item = f"(FLAGS BODY.PEEK[HEADER]{partial})" if include_flags else f"BODY.PEEK[HEADER]{partial}"
+        chunk_size = min(chunk_size, MAX_METADATA_HEADER_FETCH_UIDS)
+        for start in range(0, len(str_ids), chunk_size):
+            chunk = str_ids[start : start + chunk_size]
+            uid_list = ",".join(chunk)
+            response = await imap.uid("fetch", uid_list, fetch_item)
+            _raise_for_imap_command_failure(response, f"FETCH headers for {len(chunk)} UIDs")
+            _, data = response
+            for i, item in enumerate(data):
+                if not isinstance(item, bytes) or b"BODY[HEADER]" not in item:
+                    continue
+                uid_match = re.search(rb"UID (\d+)", item)
+                protocol_items = [item]
+                if i + 2 < len(data) and isinstance(data[i + 2], bytes):
+                    protocol_items.append(data[i + 2])
+                if uid_match and i + 1 < len(data) and isinstance(data[i + 1], bytearray):
+                    uid = uid_match.group(1).decode()
+                    raw_headers = bytes(data[i + 1])
+                    budget.add(raw_headers)
+                    metadata = self._parse_headers(uid, raw_headers)
+                elif i + 2 < len(data) and isinstance(data[i + 1], bytearray):
+                    uid_after_match = re.search(rb"UID (\d+)", data[i + 2]) if isinstance(data[i + 2], bytes) else None
+                    if uid_after_match is None:
+                        continue
                     uid = uid_after_match.group(1).decode()
                     raw_headers = bytes(data[i + 1])
+                    budget.add(raw_headers)
                     metadata = self._parse_headers(uid, raw_headers)
-                    if metadata:
-                        results[uid] = metadata
-
+                else:
+                    continue
+                if metadata:
+                    if include_flags:
+                        flags_match = next(
+                            (
+                                match
+                                for protocol in protocol_items
+                                if (match := re.search(rb"FLAGS \(([^)]*)\)", protocol)) is not None
+                            ),
+                            None,
+                        )
+                        metadata["_flags"] = (
+                            flags_match.group(1).decode(errors="replace").split() if flags_match is not None else []
+                        )
+                    results[uid] = metadata
         return results
 
     async def _batch_fetch_senders(
@@ -865,6 +1067,7 @@ class EmailClient:
         imap: aioimaplib.IMAP4_SSL | aioimaplib.IMAP4,
         email_ids: list[bytes] | list[str],
         chunk_size: int = 500,
+        header_budget: _MetadataHeaderBudget | None = None,
     ) -> dict[str, str]:
         """Batch fetch the From header for all UIDs (chunked, sequential), for allowlist filtering.
 
@@ -874,26 +1077,33 @@ class EmailClient:
         if not email_ids:
             return {}
 
+        chunk_size = min(chunk_size, MAX_METADATA_HEADER_FETCH_UIDS)
         chunks = [email_ids[i : i + chunk_size] for i in range(0, len(email_ids), chunk_size)]
         senders: dict[str, str] = {}
+        budget = header_budget or _MetadataHeaderBudget()
         for chunk in chunks:
             str_ids = [uid.decode() if isinstance(uid, bytes) else uid for uid in chunk]
             uid_list = ",".join(str_ids)
-            fetch_response = await imap.uid("fetch", uid_list, "BODY.PEEK[HEADER.FIELDS (FROM)]")
-            _raise_for_imap_command_failure(fetch_response, f"FETCH From headers for UIDs {uid_list}")
+            partial = f"<0.{MAX_METADATA_HEADER_BYTES + 1}>"
+            fetch_response = await imap.uid("fetch", uid_list, f"BODY.PEEK[HEADER.FIELDS (FROM)]{partial}")
+            _raise_for_imap_command_failure(fetch_response, f"FETCH From headers for {len(chunk)} UIDs")
             _, data = fetch_response
             for i, item in enumerate(data):
                 if not isinstance(item, bytes) or b"BODY[HEADER" not in item:
                     continue
                 uid_match = re.search(rb"UID (\d+)", item)
                 if uid_match and i + 1 < len(data) and isinstance(data[i + 1], bytearray):
-                    meta = self._parse_headers(uid_match.group(1).decode(), bytes(data[i + 1]))
+                    raw_headers = bytes(data[i + 1])
+                    budget.add(raw_headers)
+                    meta = self._parse_headers(uid_match.group(1).decode(), raw_headers)
                     if meta:
                         senders[meta["email_id"]] = meta["from"]
                 elif i + 2 < len(data) and isinstance(data[i + 1], bytearray):
                     uid_after = re.search(rb"UID (\d+)", data[i + 2]) if isinstance(data[i + 2], bytes) else None
                     if uid_after:
-                        meta = self._parse_headers(uid_after.group(1).decode(), bytes(data[i + 1]))
+                        raw_headers = bytes(data[i + 1])
+                        budget.add(raw_headers)
+                        meta = self._parse_headers(uid_after.group(1).decode(), raw_headers)
                         if meta:
                             senders[meta["email_id"]] = meta["from"]
         return senders
@@ -927,7 +1137,124 @@ class EmailClient:
         uid_senders = await self._batch_fetch_senders(imap, email_ids)
         return {uid for uid in email_ids if not sender_allowed(uid_senders.get(uid, ""), allowed_senders)}
 
-    async def get_emails_metadata(
+    @staticmethod
+    def _parse_mailbox_state(response: Any) -> MailboxState:
+        _raise_for_imap_command_failure(response, "STATUS mailbox")
+        _, data = response
+        payload = b" ".join(item for item in data if isinstance(item, bytes))
+        values: dict[bytes, int] = {}
+        for name in (b"UIDVALIDITY", b"UIDNEXT", b"MESSAGES"):
+            match = re.search(rb"\b" + name + rb"\s+(\d+)\b", payload, re.IGNORECASE)
+            if match is None:
+                raise RuntimeError("STATUS mailbox did not return required bounded state")
+            values[name] = int(match.group(1))
+        if values[b"UIDVALIDITY"] < 1 or values[b"UIDNEXT"] < 1 or values[b"MESSAGES"] < 0:
+            raise RuntimeError("STATUS mailbox returned invalid state")
+        return MailboxState(
+            uidvalidity=values[b"UIDVALIDITY"],
+            uidnext=values[b"UIDNEXT"],
+            message_count=values[b"MESSAGES"],
+        )
+
+    async def _status_mailbox(
+        self,
+        imap: aioimaplib.IMAP4_SSL | aioimaplib.IMAP4,
+        mailbox: str,
+    ) -> MailboxState:
+        response = await imap.status(_quote_mailbox(mailbox), "(UIDVALIDITY UIDNEXT MESSAGES)")
+        return self._parse_mailbox_state(response)
+
+    async def get_mailbox_state(self, mailbox: str = "INBOX") -> MailboxState:
+        """Read the small provider state needed to qualify a complete projection."""
+        imap = await self._connect_imap()
+        try:
+            await _imap_login(imap, self.email_server.user_name, self.email_server.password.get_secret_value())
+            await _send_imap_id(imap)
+            return await self._status_mailbox(imap, mailbox)
+        finally:
+            try:
+                await imap.logout()
+            except Exception:
+                logger.info("IMAP logout failed")
+
+    async def get_mailbox_metadata_snapshot(
+        self,
+        mailbox: str = "INBOX",
+        *,
+        maximum_window: int = MAX_INDEXED_UID_WINDOW,
+        candidate_limit: int = MAX_METADATA_CANDIDATES,
+    ) -> MailboxMetadataSnapshot:
+        """Observe one bounded recent UID window without fetching message bodies."""
+        if not 1 <= maximum_window <= candidate_limit:
+            raise ValueError("Metadata snapshot window is invalid")
+        imap = await self._connect_imap()
+        observed_at = datetime.now(UTC)
+        mailbox_info = MailboxInfo(name=mailbox, delimiter="", flags=[])
+        try:
+            await _imap_login(imap, self.email_server.user_name, self.email_server.password.get_secret_value())
+            await _send_imap_id(imap)
+            list_response = await imap.list(
+                '""',
+                _quote_mailbox(mailbox),  # pyright: ignore[reportArgumentType]
+            )
+            if isinstance(list_response, tuple) and str(list_response[0]).upper() == "OK":
+                for item in list_response[1]:
+                    parsed = _parse_list_response(item)
+                    if parsed is not None and parsed.name == mailbox:
+                        mailbox_info = parsed
+                        break
+            state = await self._status_mailbox(imap, mailbox)
+            select_response = await imap.select(_quote_mailbox(mailbox))
+            _raise_for_imap_error(select_response, f"SELECT mailbox {mailbox}")
+            search_response = await imap.uid_search("ALL", charset=None)
+            _raise_for_imap_command_failure(search_response, f"SEARCH mailbox {mailbox}")
+            _, messages = search_response
+            email_ids = _normalize_search_uids(messages)
+            if len(email_ids) > candidate_limit:
+                raise MetadataQueryTooBroadError(
+                    f"query_too_broad: metadata search exceeded {candidate_limit} candidate UIDs"
+                )
+            selected_ids = sorted(email_ids, key=_uid_sort_key, reverse=True)[:maximum_window]
+            uid_dates = await self._batch_fetch_dates(imap, selected_ids)
+            metadata_by_uid = await self._batch_fetch_headers(imap, selected_ids, include_flags=True)
+            emails: list[dict[str, Any]] = []
+            for uid in selected_ids:
+                metadata = metadata_by_uid.get(uid)
+                if metadata is None:
+                    continue
+                metadata["_internal_date"] = uid_dates.get(uid)
+                emails.append(metadata)
+            final_state = await self._status_mailbox(imap, mailbox)
+            valid_epoch_uids = all(
+                email["email_id"].isdigit() and 0 < int(email["email_id"]) < final_state.uidnext for email in emails
+            )
+            same_epoch = state.uidvalidity == final_state.uidvalidity
+            if not same_epoch:
+                # Rows fetched across an epoch transition have no safe namespace.
+                emails = []
+            complete = (
+                state == final_state
+                and valid_epoch_uids
+                and len(email_ids) <= maximum_window
+                and set(uid_dates) == set(email_ids)
+                and len(emails) == len(email_ids)
+                and all(isinstance(email.get("_internal_date"), datetime) for email in emails)
+                and final_state.message_count == len(email_ids)
+            )
+            return MailboxMetadataSnapshot(
+                state=final_state,
+                mailbox=mailbox_info,
+                emails=tuple(emails),
+                complete=complete,
+                observed_at=observed_at,
+            )
+        finally:
+            try:
+                await imap.logout()
+            except Exception:
+                logger.info("IMAP logout failed")
+
+    async def get_emails_metadata(  # noqa: C901 - bounded compatibility query decision tree
         self,
         page: int = 1,
         page_size: int = 10,
@@ -946,6 +1273,10 @@ class EmailClient:
         has_attachment: bool | None = None,
         allowed_senders: list[str] | None = None,
     ) -> tuple[int, list[dict[str, Any]]]:
+        if page < 1:
+            raise ValueError("page must be at least 1")
+        if not 1 <= page_size <= 100:
+            raise ValueError("page_size must be between 1 and 100")
         imap = await self._connect_imap()
         try:
             # Login and select mailbox
@@ -981,22 +1312,25 @@ class EmailClient:
             # criteria such as locale-dependent date strings.
             search_text_values = (subject, body, text, from_address, to_address)
             charset = "utf-8" if any(value and not value.isascii() for value in search_text_values) else None
-            _, messages = await imap.uid_search(*search_criteria, charset=charset)
+            search_response = await imap.uid_search(*search_criteria, charset=charset)
+            _raise_for_imap_command_failure(search_response, f"SEARCH mailbox {mailbox}")
+            _, messages = search_response
 
             # Handle empty or None responses
             if not messages or not messages[0]:
                 logger.warning("No messages returned from search")
                 return 0, []
 
-            email_ids = messages[0].split()
+            email_ids = _normalize_search_uids(messages)
             logger.info(f"Found {len(email_ids)} email IDs")
+            header_budget = _MetadataHeaderBudget()
 
             # Sender allowlist: filter candidates BEFORE sorting/pagination so total + pages stay honest.
             if allowed_senders:
-                uid_senders = await self._batch_fetch_senders(imap, email_ids)
-                email_ids = [
-                    uid for uid in email_ids if sender_allowed(uid_senders.get(uid.decode(), ""), allowed_senders)
-                ]
+                uid_senders = await self._batch_fetch_senders(imap, email_ids, header_budget=header_budget)
+                if any(uid not in uid_senders for uid in email_ids):
+                    raise RuntimeError("Provider returned incomplete sender metadata")
+                email_ids = [uid for uid in email_ids if sender_allowed(uid_senders.get(uid, ""), allowed_senders)]
                 logger.info(f"Sender allowlist active: {len(email_ids)} of {len(uid_senders)} match")
                 if not email_ids:
                     return 0, []
@@ -1006,19 +1340,19 @@ class EmailClient:
             uid_dates = await self._batch_fetch_dates(imap, email_ids)
             fetch_dates_elapsed = time.perf_counter() - fetch_dates_start
 
-            missing_date_count = len(email_ids) - len(uid_dates)
-            if missing_date_count:
-                logger.warning(
-                    f"Missing INTERNALDATE for {missing_date_count}/{len(email_ids)} searched UIDs; "
-                    "falling back to UID order for those messages"
+            requested_uid_set = set(email_ids)
+            returned_uid_set = set(uid_dates)
+            if returned_uid_set != requested_uid_set:
+                missing_date_count = len(requested_uid_set - returned_uid_set)
+                raise MetadataProviderObservationError(
+                    f"Provider returned incomplete INTERNALDATE metadata for {missing_date_count} UIDs"
                 )
 
-            # Keep UID SEARCH results as the source of truth. Use INTERNALDATE where
-            # available, and fall back to UID ordering for provider-specific
-            # INTERNALDATE response formats that cannot be parsed.
+            # Keep UID SEARCH results as the source of truth and require
+            # INTERNALDATE for exact provider-compatible ordering.
             if order == "desc":
                 sorted_uids = sorted(
-                    (uid.decode() for uid in email_ids),
+                    (uid.decode() if isinstance(uid, bytes) else uid for uid in email_ids),
                     key=lambda uid: (
                         uid_dates.get(uid) is not None,
                         uid_dates.get(uid) or datetime.min.replace(tzinfo=UTC),
@@ -1028,7 +1362,7 @@ class EmailClient:
                 )
             else:
                 sorted_uids = sorted(
-                    (uid.decode() for uid in email_ids),
+                    (uid.decode() if isinstance(uid, bytes) else uid for uid in email_ids),
                     key=lambda uid: (
                         uid_dates.get(uid) is None,
                         uid_dates.get(uid) or datetime.max.replace(tzinfo=UTC),
@@ -1046,7 +1380,7 @@ class EmailClient:
 
             # Phase 2: Batch fetch headers for requested page only
             fetch_headers_start = time.perf_counter()
-            metadata_by_uid = await self._batch_fetch_headers(imap, page_uids)
+            metadata_by_uid = await self._batch_fetch_headers(imap, page_uids, header_budget=header_budget)
             fetch_headers_elapsed = time.perf_counter() - fetch_headers_start
 
             logger.info(
@@ -1054,14 +1388,16 @@ class EmailClient:
                 f"{fetch_headers_elapsed:.2f}s headers ({len(page_uids)} UIDs)"
             )
 
-            # Collect page results in sorted order
-            page_emails = [metadata_by_uid[uid] for uid in page_uids if uid in metadata_by_uid]
+            missing_page_uids = [uid for uid in page_uids if uid not in metadata_by_uid]
+            if missing_page_uids:
+                raise RuntimeError("Provider returned an incomplete metadata page")
+            page_emails = [metadata_by_uid[uid] for uid in page_uids]
             return len(email_ids), page_emails
         finally:
             try:
                 await imap.logout()
-            except Exception as e:
-                logger.info(f"Error during logout: {e}")
+            except Exception:
+                logger.info("IMAP logout failed")
 
     def _check_email_content(self, data: list) -> bool:
         """Check if the fetched data contains actual email content."""
@@ -1117,6 +1453,8 @@ class EmailClient:
         body_offset: int = 0,
         max_body_length: int = MAX_BODY_LENGTH,
     ) -> dict[str, Any] | None:
+        del mark_as_read  # Compatibility argument; the application owns the mutation.
+        validate_imap_uid(email_id)
         imap = await self._connect_imap()
         try:
             # Login and select mailbox
@@ -1144,6 +1482,9 @@ class EmailClient:
             if not raw_email:
                 logger.error(f"Could not find email data in response for email ID: {email_id}")
                 return None
+            if len(raw_email) > MAX_RAW_EMAIL_BYTES:
+                logger.error(f"Email {email_id} exceeds the raw message size limit")
+                return None
 
             # Parse the email
             try:
@@ -1154,36 +1495,29 @@ class EmailClient:
                 logger.error(f"Error parsing email: {e!s}")
                 return None
 
-            if mark_as_read:
-                try:
-                    store_response = await imap.uid("store", email_id, "+FLAGS", r"(\Seen)")
-                    _raise_for_imap_error(store_response, f"STORE \\Seen for email {email_id}")
-                except Exception as e:
-                    logger.warning(f"Failed to mark email {email_id} as read: {e}")
-
+            # Marking is intentionally owned by the application mutation
+            # service after a successful body retrieval.
             return email_data
 
         finally:
             # Ensure we logout properly
             try:
                 await imap.logout()
-            except Exception as e:
-                logger.info(f"Error during logout: {e}")
+            except Exception:
+                logger.info("IMAP logout failed")
 
-    async def download_attachment(
+    async def fetch_attachment(  # noqa: C901 - bounded MIME selection and provider cleanup
         self,
         email_id: str,
         attachment_name: str,
-        save_path: str,
         mailbox: str = "INBOX",
         allowed_senders: list[str] | None = None,
     ) -> dict[str, Any]:
-        """Download a specific attachment from an email and save it to disk.
+        """Fetch a specific attachment without performing a filesystem write.
 
         Args:
             email_id: The UID of the email containing the attachment.
             attachment_name: The filename of the attachment to download.
-            save_path: The local path where the attachment will be saved.
             mailbox: The mailbox to search in (default: "INBOX").
             allowed_senders: Optional sender allowlist; when set, a non-allowed sender's
                 message is treated as not found and its body is never fetched.
@@ -1191,6 +1525,7 @@ class EmailClient:
         Returns:
             A dictionary with download result information.
         """
+        validate_imap_uid(email_id)
         imap = await self._connect_imap()
         try:
             await _imap_login(imap, self.email_server.user_name, self.email_server.password.get_secret_value())
@@ -1214,6 +1549,8 @@ class EmailClient:
                 msg = f"Could not find email data for email ID: {email_id}"
                 logger.error(msg)
                 raise ValueError(msg)
+            if len(raw_email) > MAX_RAW_EMAIL_BYTES:
+                raise ValueError("Email exceeds the raw message size limit")
 
             parser = BytesParser(policy=default)
             email_message = parser.parsebytes(raw_email)
@@ -1241,27 +1578,45 @@ class EmailClient:
                 msg = f"Attachment '{attachment_name}' not found in email {email_id}"
                 logger.error(msg)
                 raise ValueError(msg)
-
-            # Save to disk
-            save_file = Path(save_path)
-            save_file.parent.mkdir(parents=True, exist_ok=True)
-            save_file.write_bytes(attachment_data)
-
-            logger.info(f"Attachment '{attachment_name}' saved to {save_path}")
+            if len(attachment_data) > MAX_ATTACHMENT_BYTES:
+                raise ValueError(f"attachment exceeds {MAX_ATTACHMENT_BYTES} bytes")
 
             return {
                 "email_id": email_id,
                 "attachment_name": attachment_name,
                 "mime_type": mime_type or "application/octet-stream",
-                "size": len(attachment_data),
-                "saved_path": str(save_file.resolve()),
+                "content": attachment_data,
             }
 
         finally:
             try:
                 await imap.logout()
-            except Exception as e:
-                logger.info(f"Error during logout: {e}")
+            except Exception:
+                logger.info("IMAP logout failed")
+
+    async def download_attachment(
+        self,
+        email_id: str,
+        attachment_name: str,
+        save_path: str,
+        mailbox: str = "INBOX",
+        allowed_senders: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Compatibility wrapper that writes a fetched attachment to the requested path."""
+        result = await self.fetch_attachment(email_id, attachment_name, mailbox, allowed_senders)
+        content = result["content"]
+        if not isinstance(content, bytes):
+            raise TypeError("Attachment content is invalid")
+        save_file = Path(save_path)
+        save_file.parent.mkdir(parents=True, exist_ok=True)
+        save_file.write_bytes(content)
+        return {
+            "email_id": result["email_id"],
+            "attachment_name": result["attachment_name"],
+            "mime_type": result["mime_type"],
+            "size": len(content),
+            "saved_path": str(save_file.resolve()),
+        }
 
     def _validate_attachment(self, file_path: str) -> Path:
         """Validate attachment file path."""
@@ -1278,16 +1633,29 @@ class EmailClient:
 
         return path
 
-    def _create_attachment_part(self, path: Path) -> MIMEApplication:
-        """Create MIME attachment part from file."""
-        with open(path, "rb") as f:
-            file_data = f.read()
+    def _read_attachment(self, path: Path) -> bytes:
+        """Read one attachment without allowing a preflight-to-read size race."""
+        with path.open("rb") as source:
+            file_data = source.read(MAX_ATTACHMENT_BYTES + 1)
+        if len(file_data) > MAX_ATTACHMENT_BYTES:
+            raise ValueError(f"an attachment exceeds {MAX_ATTACHMENT_BYTES} bytes")
+        return file_data
 
+    @staticmethod
+    def _validate_total_attachment_bytes(total_bytes: int) -> None:
+        if total_bytes > MAX_TOTAL_ATTACHMENT_BYTES:
+            raise ValueError(f"attachments exceed {MAX_TOTAL_ATTACHMENT_BYTES} bytes in total")
+
+    def _create_attachment_part(self, path: Path, file_data: bytes) -> MIMEBase:
+        """Create a MIME attachment part from already bounded bytes."""
         mime_type, _ = mimetypes.guess_type(str(path))
         if mime_type is None:
             mime_type = "application/octet-stream"
+        main_type, sub_type = mime_type.split("/", 1)
 
-        attachment_part = MIMEApplication(file_data, _subtype=mime_type.split("/")[1])
+        attachment_part = MIMEBase(main_type, sub_type)
+        attachment_part.set_payload(file_data)
+        encoders.encode_base64(attachment_part)
         attachment_part.add_header(
             "Content-Disposition",
             "attachment",
@@ -1303,10 +1671,14 @@ class EmailClient:
         text_part = MIMEText(body, content_type, "utf-8")
         msg.attach(text_part)
 
+        total_attachment_bytes = 0
         for file_path in attachments:
             try:
                 path = self._validate_attachment(file_path)
-                attachment_part = self._create_attachment_part(path)
+                file_data = self._read_attachment(path)
+                total_attachment_bytes += len(file_data)
+                self._validate_total_attachment_bytes(total_attachment_bytes)
+                attachment_part = self._create_attachment_part(path, file_data)
                 msg.attach(attachment_part)
             except Exception as e:
                 logger.error(f"Failed to attach file {file_path}: {e}")
@@ -1388,6 +1760,165 @@ class EmailClient:
 
         return msg
 
+    async def send_email_with_outcome(  # noqa: C901 - explicit SMTP phase evidence
+        self,
+        recipients: list[str],
+        subject: str,
+        body: str,
+        cc: list[str] | None = None,
+        bcc: list[str] | None = None,
+        html: bool = False,
+        attachments: list[str] | None = None,
+        in_reply_to: str | None = None,
+        references: str | None = None,
+        reply_to: str | None = None,
+    ) -> DeliveryMutationOutcome:
+        """Run one SMTP transaction and preserve phase-specific delivery evidence."""
+        msg = self.compose_message(
+            recipients, subject, body, cc, bcc, html, attachments, in_reply_to, references, False, reply_to
+        )
+        all_recipients = [*recipients, *(cc or []), *(bcc or [])]
+        envelope_recipients = [email.utils.parseaddr(recipient)[1] for recipient in all_recipients]
+        envelope_sender = email.utils.parseaddr(self.sender)[1] or self.sender
+
+        async def submit(smtp: aiosmtplib.SMTP) -> DeliveryMutationOutcome:  # noqa: C901
+            utf8_required = False
+            try:
+                envelope_sender.encode("ascii")
+                "".join(envelope_recipients).encode("ascii")
+            except UnicodeEncodeError:
+                utf8_required = True
+
+            mail_options: list[str] = []
+            if utf8_required:
+                if not smtp.supports_extension("smtputf8"):
+                    return DeliveryMutationOutcome(
+                        tuple(
+                            TargetMutationOutcome(target, "failed", "smtp-utf8-unsupported")
+                            for target in all_recipients
+                        ),
+                        None,
+                    )
+                mail_options.append("SMTPUTF8")
+            if smtp.supports_extension("8bitmime"):
+                mail_options.append("BODY=8BITMIME")
+            policy = SMTPUTF8_POLICY if utf8_required else SMTP_POLICY
+            message_bytes = msg.as_bytes(policy=policy)
+            if smtp.supports_extension("size"):
+                mail_options.insert(0, f"SIZE={len(message_bytes)}")
+
+            try:
+                await smtp.mail(
+                    envelope_sender,
+                    options=mail_options,
+                    encoding="utf-8" if utf8_required else "ascii",
+                )
+            except asyncio.CancelledError:
+                return DeliveryMutationOutcome(
+                    tuple(TargetMutationOutcome(target, "failed", "smtp-mail-cancelled") for target in all_recipients),
+                    None,
+                )
+            except (SMTPResponseException, SMTPNotSupported):
+                return DeliveryMutationOutcome(
+                    tuple(TargetMutationOutcome(target, "failed", "smtp-mail-rejected") for target in all_recipients),
+                    None,
+                )
+            except Exception:
+                return DeliveryMutationOutcome(
+                    tuple(
+                        TargetMutationOutcome(target, "failed", "smtp-mail-unavailable") for target in all_recipients
+                    ),
+                    None,
+                )
+
+            outcomes: list[TargetMutationOutcome | None] = [None] * len(all_recipients)
+            accepted_indexes: list[int] = []
+            for index, (target, recipient) in enumerate(zip(all_recipients, envelope_recipients, strict=True)):
+                try:
+                    await smtp.rcpt(recipient, encoding="utf-8" if utf8_required else "ascii")
+                except asyncio.CancelledError:
+                    for accepted_index in accepted_indexes:
+                        outcomes[accepted_index] = TargetMutationOutcome(
+                            all_recipients[accepted_index], "failed", "smtp-cancelled-before-data"
+                        )
+                    outcomes[index] = TargetMutationOutcome(target, "failed", "smtp-cancelled-before-data")
+                    for remaining_index in range(index + 1, len(all_recipients)):
+                        outcomes[remaining_index] = TargetMutationOutcome(
+                            all_recipients[remaining_index], "failed", "not-attempted"
+                        )
+                    return DeliveryMutationOutcome(tuple(item for item in outcomes if item is not None), None)
+                except (SMTPRecipientRefused, SMTPResponseException):
+                    outcomes[index] = TargetMutationOutcome(target, "failed", "smtp-recipient-rejected")
+                except Exception:
+                    for accepted_index in accepted_indexes:
+                        outcomes[accepted_index] = TargetMutationOutcome(
+                            all_recipients[accepted_index], "failed", "smtp-session-lost-before-data"
+                        )
+                    outcomes[index] = TargetMutationOutcome(target, "failed", "smtp-session-lost-before-data")
+                    for remaining_index in range(index + 1, len(all_recipients)):
+                        outcomes[remaining_index] = TargetMutationOutcome(
+                            all_recipients[remaining_index], "failed", "not-attempted"
+                        )
+                    return DeliveryMutationOutcome(tuple(item for item in outcomes if item is not None), None)
+                else:
+                    accepted_indexes.append(index)
+
+            if not accepted_indexes:
+                return DeliveryMutationOutcome(tuple(item for item in outcomes if item is not None), None)
+
+            accepted_status: MutationStatus
+            try:
+                await smtp.data(message_bytes)
+            except asyncio.CancelledError:
+                accepted_status = "unknown"
+                accepted_detail = "smtp-data-unknown"
+            except SMTPResponseException:
+                accepted_status = "failed"
+                accepted_detail = "smtp-data-rejected"
+            except Exception:
+                accepted_status = "unknown"
+                accepted_detail = "smtp-data-unknown"
+            else:
+                accepted_status = "succeeded"
+                accepted_detail = None
+
+            for accepted_index in accepted_indexes:
+                outcomes[accepted_index] = TargetMutationOutcome(
+                    all_recipients[accepted_index], accepted_status, accepted_detail
+                )
+            delivery_outcomes = tuple(item for item in outcomes if item is not None)
+            return DeliveryMutationOutcome(
+                delivery_outcomes,
+                msg if accepted_status == "succeeded" else None,
+            )
+
+        known_outcome: DeliveryMutationOutcome | None = None
+        try:
+            async with aiosmtplib.SMTP(
+                hostname=self.email_server.host,
+                port=self.email_server.port,
+                start_tls=self.smtp_start_tls,
+                use_tls=self.smtp_use_tls,
+                tls_context=self._get_smtp_ssl_context(),
+            ) as smtp:
+                await smtp.login(self.email_server.user_name, self.email_server.password.get_secret_value())
+                known_outcome = await submit(smtp)
+        except asyncio.CancelledError:
+            # Cancellation while closing a completed transaction must not erase
+            # DATA evidence. Setup cancellation still propagates to the caller.
+            if known_outcome is not None:
+                return known_outcome
+            raise
+        except Exception:
+            # QUIT is cleanup: once a phase outcome exists, a close failure
+            # cannot change SMTP delivery evidence.
+            if known_outcome is not None:
+                return known_outcome
+            raise
+        if known_outcome is None:  # pragma: no cover - defensive control-flow invariant
+            raise RuntimeError("SMTP transaction completed without an outcome")
+        return known_outcome
+
     async def send_email(
         self,
         recipients: list[str],
@@ -1449,6 +1980,75 @@ class EmailClient:
             logger.debug(f"Error finding Sent folder by flag: {e}")
 
         return None
+
+    async def append_to_sent_with_outcome(  # noqa: C901 - mailbox discovery plus APPEND evidence
+        self,
+        msg: MIMEText | MIMEMultipart,
+        incoming_server: EmailServer,
+        sent_folder_name: str | None = None,
+    ) -> SentCopyMutationOutcome:
+        """Append a sent copy once, without replay after an ambiguous APPEND."""
+        imap = await self._connect_imap_server(incoming_server)
+        candidates = [
+            sent_folder_name,
+            "Sent",
+            "INBOX.Sent",
+            "Sent Items",
+            "Sent Mail",
+            "[Gmail]/Sent Mail",
+            "INBOX/Sent",
+        ]
+        folders: list[str] = []
+        for folder in candidates:
+            if folder is None or folder in folders:
+                continue
+            try:
+                validate_mailbox_name(folder)
+            except ValueError:
+                continue
+            folders.append(folder)
+        try:
+            await _imap_login(imap, incoming_server.user_name, incoming_server.password.get_secret_value())
+            await _send_imap_id(imap)
+            flag_folder = await self._find_sent_folder_by_flag(imap)
+            if flag_folder is not None and flag_folder not in folders:
+                try:
+                    validate_mailbox_name(flag_folder)
+                except ValueError:
+                    logger.debug("Ignoring invalid provider-derived Sent mailbox")
+                else:
+                    folders.insert(0, flag_folder)
+            for folder in folders:
+                try:
+                    select_result = await imap.select(_quote_mailbox(folder))
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.debug("Sent mailbox selection failed")
+                    continue
+                if _imap_status(select_result) != "OK":
+                    continue
+                try:
+                    append_result = await imap.append(
+                        msg.as_bytes(),
+                        mailbox=_quote_mailbox(folder),
+                        flags=r"(\Seen)",
+                    )
+                except asyncio.CancelledError:
+                    return SentCopyMutationOutcome("unknown", folder, "append-unknown")
+                except Exception:
+                    return SentCopyMutationOutcome("unknown", folder, "append-unknown")
+                append_status = _imap_effect_status(append_result)
+                if append_status == "succeeded":
+                    return SentCopyMutationOutcome("succeeded", folder)
+                return SentCopyMutationOutcome(
+                    append_status,
+                    folder,
+                    "append-rejected" if append_status == "failed" else "append-unknown",
+                )
+            return SentCopyMutationOutcome("failed", detail="mailbox-unavailable")
+        finally:
+            await _best_effort_imap_logout(imap)
 
     async def append_to_sent(
         self,
@@ -1535,8 +2135,58 @@ class EmailClient:
         finally:
             try:
                 await imap.logout()
-            except Exception as e:
-                logger.debug(f"Error during logout: {e}")
+            except Exception:
+                logger.debug("IMAP logout failed")
+
+    async def append_to_mailbox_with_outcome(
+        self,
+        msg: MIMEText | MIMEMultipart,
+        incoming_server: EmailServer,
+        mailbox: str,
+        flags: str = r"(\Draft \Seen)",
+    ) -> AppendMutationOutcome:
+        """Append exactly once and distinguish rejection from a lost result."""
+        message_id = msg["Message-Id"] or "saved"
+        imap = await self._connect_imap_server(incoming_server)
+        try:
+            await _imap_login(imap, incoming_server.user_name, incoming_server.password.get_secret_value())
+            await _send_imap_id(imap)
+            select_result = await imap.select(_quote_mailbox(mailbox))
+            if _imap_status(select_result) != "OK":
+                return AppendMutationOutcome("failed", message_id, mailbox=mailbox, detail="mailbox-unavailable")
+            try:
+                append_result = await imap.append(
+                    msg.as_bytes(),
+                    mailbox=_quote_mailbox(mailbox),
+                    flags=flags,
+                )
+            except asyncio.CancelledError:
+                return AppendMutationOutcome("unknown", message_id, mailbox=mailbox, detail="append-unknown")
+            except Exception:
+                return AppendMutationOutcome("unknown", message_id, mailbox=mailbox, detail="append-unknown")
+            append_status = _imap_effect_status(append_result)
+            if append_status != "succeeded":
+                return AppendMutationOutcome(
+                    append_status,
+                    message_id,
+                    mailbox=mailbox,
+                    detail="append-rejected" if append_status == "failed" else "append-unknown",
+                )
+            uid: str | None = None
+            if isinstance(append_result, tuple) and len(append_result) > 1:
+                for part in append_result[1]:
+                    part_text = part.decode("utf-8", errors="replace") if isinstance(part, bytes) else str(part)
+                    match = re.search(
+                        r"APPENDUID\s+[1-9][0-9]*\s+([1-9][0-9]*)(?=\s|\]|$)",
+                        part_text,
+                        re.IGNORECASE,
+                    )
+                    if match is not None and int(match.group(1)) <= MAX_IMAP_UID:
+                        uid = match.group(1)
+                        break
+            return AppendMutationOutcome("succeeded", message_id, uid=uid, mailbox=mailbox)
+        finally:
+            await _best_effort_imap_logout(imap)
 
     async def append_to_mailbox(
         self,
@@ -1595,8 +2245,274 @@ class EmailClient:
         finally:
             try:
                 await imap.logout()
-            except Exception as e:
-                logger.debug(f"Error during logout: {e}")
+            except Exception:
+                logger.debug("IMAP logout failed")
+
+    async def delete_emails_with_outcome(  # noqa: C901 - explicit effect-boundary states
+        self,
+        email_ids: list[str],
+        mailbox: str = "INBOX",
+        allowed_senders: list[str] | None = None,
+        report_blocked_mutations: bool = False,
+    ) -> BatchMutationOutcome:
+        """Delete scoped UIDs while preserving STORE and UID EXPUNGE evidence."""
+        _validate_imap_uids(email_ids)
+        imap = await self._connect_imap()
+        outcomes: dict[str, TargetMutationOutcome] = {}
+        try:
+            await _imap_login(imap, self.email_server.user_name, self.email_server.password.get_secret_value())
+            await _send_imap_id(imap)
+            await _refresh_imap_capabilities(imap)
+            select_response = await imap.select(_quote_mailbox(mailbox))
+            _raise_for_imap_error(select_response, f"SELECT mailbox {mailbox}")
+            blocked = await self._blocked_uids(imap, email_ids, allowed_senders)
+            permitted: list[str] = []
+            for email_id in email_ids:
+                if email_id in blocked:
+                    outcomes[email_id] = TargetMutationOutcome(
+                        email_id,
+                        "failed" if report_blocked_mutations else "succeeded",
+                        "sender-policy" if report_blocked_mutations else None,
+                    )
+                else:
+                    permitted.append(email_id)
+            if permitted and not _supports_uid_expunge(imap):
+                for email_id in permitted:
+                    outcomes[email_id] = TargetMutationOutcome(email_id, "failed", "uidplus-unavailable")
+            else:
+                pending_expunge: list[str] = []
+                store_cancelled = False
+                for index, email_id in enumerate(permitted):
+                    try:
+                        response = await imap.uid("store", email_id, "+FLAGS", r"(\Deleted)")
+                    except asyncio.CancelledError:
+                        outcomes[email_id] = TargetMutationOutcome(email_id, "unknown", "store-unknown")
+                        for remaining_id in permitted[index + 1 :]:
+                            outcomes[remaining_id] = TargetMutationOutcome(remaining_id, "failed", "not-attempted")
+                        for pending_id in pending_expunge:
+                            outcomes[pending_id] = TargetMutationOutcome(pending_id, "unknown", "expunge-not-attempted")
+                        store_cancelled = True
+                        break
+                    except Exception:
+                        outcomes[email_id] = TargetMutationOutcome(email_id, "unknown", "store-unknown")
+                        continue
+                    store_status = _imap_effect_status(response)
+                    if store_status != "succeeded":
+                        outcomes[email_id] = TargetMutationOutcome(
+                            email_id,
+                            store_status,
+                            "store-rejected" if store_status == "failed" else "store-unknown",
+                        )
+                        continue
+                    pending_expunge.append(email_id)
+                if pending_expunge and not store_cancelled:
+                    expunge_detail = "expunge-unknown"
+                    try:
+                        response = await imap.uid("expunge", ",".join(pending_expunge))
+                    except asyncio.CancelledError:
+                        response = None
+                    except Exception:
+                        response = None
+                    else:
+                        if _imap_effect_status(response) == "failed":
+                            expunge_detail = "expunge-rejected"
+                    if response is not None and _imap_effect_status(response) == "succeeded":
+                        for email_id in pending_expunge:
+                            outcomes[email_id] = TargetMutationOutcome(email_id, "succeeded")
+                    else:
+                        for email_id in pending_expunge:
+                            outcomes[email_id] = TargetMutationOutcome(email_id, "unknown", expunge_detail)
+        finally:
+            await _best_effort_imap_logout(imap)
+        return BatchMutationOutcome(tuple(outcomes[email_id] for email_id in email_ids))
+
+    async def mark_emails_as_read_with_outcome(
+        self,
+        email_ids: list[str],
+        mailbox: str = "INBOX",
+        allowed_senders: list[str] | None = None,
+        report_blocked_mutations: bool = False,
+    ) -> BatchMutationOutcome:
+        """Set \\Seen once per UID and retain cancellation evidence."""
+        _validate_imap_uids(email_ids)
+        imap = await self._connect_imap()
+        outcomes: list[TargetMutationOutcome] = []
+        try:
+            await _imap_login(imap, self.email_server.user_name, self.email_server.password.get_secret_value())
+            await _send_imap_id(imap)
+            select_response = await imap.select(_quote_mailbox(mailbox))
+            _raise_for_imap_error(select_response, f"SELECT mailbox {mailbox}")
+            blocked = await self._blocked_uids(imap, email_ids, allowed_senders)
+            for index, email_id in enumerate(email_ids):
+                if email_id in blocked:
+                    outcomes.append(
+                        TargetMutationOutcome(
+                            email_id,
+                            "failed" if report_blocked_mutations else "succeeded",
+                            "sender-policy" if report_blocked_mutations else None,
+                        )
+                    )
+                    continue
+                try:
+                    response = await imap.uid("store", email_id, "+FLAGS", r"(\Seen)")
+                except asyncio.CancelledError:
+                    outcomes.append(TargetMutationOutcome(email_id, "unknown", "store-unknown"))
+                    for remaining_id in email_ids[index + 1 :]:
+                        if remaining_id in blocked:
+                            outcomes.append(
+                                TargetMutationOutcome(
+                                    remaining_id,
+                                    "failed" if report_blocked_mutations else "succeeded",
+                                    "sender-policy" if report_blocked_mutations else None,
+                                )
+                            )
+                        else:
+                            outcomes.append(TargetMutationOutcome(remaining_id, "failed", "not-attempted"))
+                    break
+                except Exception:
+                    outcomes.append(TargetMutationOutcome(email_id, "unknown", "store-unknown"))
+                    continue
+                store_status = _imap_effect_status(response)
+                outcomes.append(
+                    TargetMutationOutcome(
+                        email_id,
+                        store_status,
+                        None
+                        if store_status == "succeeded"
+                        else "store-rejected"
+                        if store_status == "failed"
+                        else "store-unknown",
+                    )
+                )
+        finally:
+            await _best_effort_imap_logout(imap)
+        return BatchMutationOutcome(tuple(outcomes))
+
+    async def move_emails_with_outcome(  # noqa: C901 - explicit native/fallback states
+        self,
+        email_ids: list[str],
+        source_mailbox: str,
+        destination_mailbox: str,
+        allowed_senders: list[str] | None = None,
+        report_blocked_mutations: bool = False,
+    ) -> BatchMutationOutcome:
+        """Move UIDs with native MOVE or scoped COPY/STORE/UID EXPUNGE evidence."""
+        _validate_imap_uids(email_ids)
+        imap = await self._connect_imap()
+        outcomes: dict[str, TargetMutationOutcome] = {}
+        try:
+            await _imap_login(imap, self.email_server.user_name, self.email_server.password.get_secret_value())
+            await _send_imap_id(imap)
+            capabilities = await _refresh_imap_capabilities(imap)
+            select_response = await imap.select(_quote_mailbox(source_mailbox))
+            _raise_for_imap_error(select_response, f"SELECT source mailbox {source_mailbox}")
+            has_move = "MOVE" in capabilities
+            blocked = await self._blocked_uids(imap, email_ids, allowed_senders)
+            permitted: list[str] = []
+            for email_id in email_ids:
+                if email_id in blocked:
+                    outcomes[email_id] = TargetMutationOutcome(
+                        email_id,
+                        "failed" if report_blocked_mutations else "succeeded",
+                        "sender-policy" if report_blocked_mutations else None,
+                    )
+                else:
+                    permitted.append(email_id)
+            if permitted and not has_move and not _supports_uid_expunge(imap):
+                for email_id in permitted:
+                    outcomes[email_id] = TargetMutationOutcome(email_id, "failed", "uidplus-unavailable")
+            elif has_move:
+                for index, email_id in enumerate(permitted):
+                    try:
+                        response = await imap.uid("move", email_id, _quote_mailbox(destination_mailbox))
+                    except asyncio.CancelledError:
+                        outcomes[email_id] = TargetMutationOutcome(email_id, "unknown", "move-unknown")
+                        for remaining_id in permitted[index + 1 :]:
+                            outcomes[remaining_id] = TargetMutationOutcome(remaining_id, "failed", "not-attempted")
+                        break
+                    except Exception:
+                        outcomes[email_id] = TargetMutationOutcome(email_id, "unknown", "move-unknown")
+                        continue
+                    move_status = _imap_effect_status(response)
+                    outcomes[email_id] = TargetMutationOutcome(
+                        email_id,
+                        move_status,
+                        None
+                        if move_status == "succeeded"
+                        else "move-rejected"
+                        if move_status == "failed"
+                        else "move-unknown",
+                    )
+            else:
+                pending_expunge: list[str] = []
+                stopped = False
+                for index, email_id in enumerate(permitted):
+                    try:
+                        copy_response = await imap.uid("copy", email_id, _quote_mailbox(destination_mailbox))
+                    except asyncio.CancelledError:
+                        outcomes[email_id] = TargetMutationOutcome(email_id, "unknown", "copy-unknown")
+                        for remaining_id in permitted[index + 1 :]:
+                            outcomes[remaining_id] = TargetMutationOutcome(remaining_id, "failed", "not-attempted")
+                        stopped = True
+                        break
+                    except Exception:
+                        outcomes[email_id] = TargetMutationOutcome(email_id, "unknown", "copy-unknown")
+                        continue
+                    copy_status = _imap_effect_status(copy_response)
+                    if copy_status != "succeeded":
+                        outcomes[email_id] = TargetMutationOutcome(
+                            email_id,
+                            copy_status,
+                            "copy-rejected" if copy_status == "failed" else "copy-unknown",
+                        )
+                        continue
+                    try:
+                        store_response = await imap.uid("store", email_id, "+FLAGS", r"(\Deleted)")
+                    except asyncio.CancelledError:
+                        outcomes[email_id] = TargetMutationOutcome(email_id, "unknown", "copy-succeeded-store-unknown")
+                        for remaining_id in permitted[index + 1 :]:
+                            outcomes[remaining_id] = TargetMutationOutcome(remaining_id, "failed", "not-attempted")
+                        stopped = True
+                        break
+                    except Exception:
+                        outcomes[email_id] = TargetMutationOutcome(email_id, "unknown", "copy-succeeded-store-unknown")
+                        continue
+                    store_status = _imap_effect_status(store_response)
+                    if store_status != "succeeded":
+                        outcomes[email_id] = TargetMutationOutcome(
+                            email_id,
+                            "unknown",
+                            "copy-succeeded-store-failed"
+                            if store_status == "failed"
+                            else "copy-succeeded-store-unknown",
+                        )
+                        continue
+                    pending_expunge.append(email_id)
+                if stopped:
+                    for pending_id in pending_expunge:
+                        outcomes[pending_id] = TargetMutationOutcome(
+                            pending_id, "unknown", "expunge-after-copy-not-attempted"
+                        )
+                elif pending_expunge:
+                    expunge_detail = "expunge-after-copy-unknown"
+                    try:
+                        expunge_response = await imap.uid("expunge", ",".join(pending_expunge))
+                    except asyncio.CancelledError:
+                        expunge_response = None
+                    except Exception:
+                        expunge_response = None
+                    else:
+                        if _imap_effect_status(expunge_response) == "failed":
+                            expunge_detail = "expunge-after-copy-failed"
+                    if expunge_response is not None and _imap_effect_status(expunge_response) == "succeeded":
+                        for email_id in pending_expunge:
+                            outcomes[email_id] = TargetMutationOutcome(email_id, "succeeded")
+                    else:
+                        for email_id in pending_expunge:
+                            outcomes[email_id] = TargetMutationOutcome(email_id, "unknown", expunge_detail)
+        finally:
+            await _best_effort_imap_logout(imap)
+        return BatchMutationOutcome(tuple(outcomes[email_id] for email_id in email_ids))
 
     async def delete_emails(
         self,
@@ -1618,39 +2534,54 @@ class EmailClient:
         try:
             await _imap_login(imap, self.email_server.user_name, self.email_server.password.get_secret_value())
             await _send_imap_id(imap)
+            await _refresh_imap_capabilities(imap)
             select_response = await imap.select(_quote_mailbox(mailbox))
             _raise_for_imap_error(select_response, f"SELECT mailbox {mailbox}")
 
-            blocked = await self._blocked_uids(imap, email_ids, allowed_senders)
-            deleted_any = False
-            for email_id in email_ids:
-                if email_id in blocked:
-                    (failed_ids if report_blocked_mutations else deleted_ids).append(email_id)
-                    continue
-                try:
-                    store_response = await imap.uid("store", email_id, "+FLAGS", r"(\Deleted)")
-                    _raise_for_imap_error(store_response, f"STORE \\Deleted for email {email_id}")
-                    deleted_ids.append(email_id)
-                    deleted_any = True
-                except Exception as e:
-                    logger.error(f"Failed to delete email {email_id}: {e}")
-                    failed_ids.append(email_id)
+            unique_email_ids = list(dict.fromkeys(email_ids))
+            blocked = await self._blocked_uids(imap, unique_email_ids, allowed_senders)
+            permitted_ids = [email_id for email_id in unique_email_ids if email_id not in blocked]
+            for email_id in blocked:
+                (failed_ids if report_blocked_mutations else deleted_ids).append(email_id)
 
-            if deleted_any:
-                try:
-                    expunge_response = await imap.expunge()
-                    _raise_for_imap_error(expunge_response, "EXPUNGE deleted emails")
-                except Exception as e:
-                    logger.error(f"Failed to expunge deleted emails: {e}")
-                    failed_ids.extend(deleted_ids)
-                    deleted_ids = []
+            # Bare EXPUNGE would remove unrelated messages already marked
+            # \Deleted by another client. Refuse before STORE unless the exact
+            # target UIDs can be expunged through RFC 4315 UIDPLUS.
+            if permitted_ids and not _supports_uid_expunge(imap):
+                logger.warning("Refusing message-scoped delete because the server does not advertise UIDPLUS")
+                failed_ids.extend(permitted_ids)
+            else:
+                expunge_ids: list[str] = []
+                for email_id in permitted_ids:
+                    try:
+                        store_response = await imap.uid("store", email_id, "+FLAGS", r"(\Deleted)")
+                        _raise_for_imap_error(store_response, f"STORE \\Deleted for email {email_id}")
+                        deleted_ids.append(email_id)
+                        expunge_ids.append(email_id)
+                    except Exception as e:
+                        logger.error(f"Failed to delete email {email_id}: {e}")
+                        failed_ids.append(email_id)
+
+                if expunge_ids:
+                    try:
+                        await _uid_expunge(imap, expunge_ids, "UID EXPUNGE deleted emails")
+                    except Exception as e:
+                        logger.error(f"Failed to expunge deleted emails: {e}")
+                        expunge_set = set(expunge_ids)
+                        failed_ids.extend(expunge_ids)
+                        deleted_ids = [email_id for email_id in deleted_ids if email_id not in expunge_set]
         finally:
             try:
                 await imap.logout()
-            except Exception as e:
-                logger.info(f"Error during logout: {e}")
+            except Exception:
+                logger.info("IMAP logout failed")
 
-        return deleted_ids, failed_ids
+        deleted_set = set(deleted_ids)
+        failed_set = set(failed_ids)
+        return (
+            [email_id for email_id in email_ids if email_id in deleted_set],
+            [email_id for email_id in email_ids if email_id in failed_set],
+        )
 
     async def mark_emails_as_read(
         self,
@@ -1689,8 +2620,8 @@ class EmailClient:
         finally:
             try:
                 await imap.logout()
-            except Exception as e:
-                logger.info(f"Error during logout: {e}")
+            except Exception:
+                logger.info("IMAP logout failed")
 
         return marked_ids, failed_ids
 
@@ -1714,48 +2645,62 @@ class EmailClient:
         try:
             await _imap_login(imap, self.email_server.user_name, self.email_server.password.get_secret_value())
             await _send_imap_id(imap)
+            capabilities = await _refresh_imap_capabilities(imap)
             select_response = await imap.select(_quote_mailbox(source_mailbox))
             _raise_for_imap_error(select_response, f"SELECT source mailbox {source_mailbox}")
 
-            capabilities = {str(capability).upper() for capability in getattr(imap, "capabilities", ())}
-            has_move = hasattr(imap, "move") and "MOVE" in capabilities
+            has_move = "MOVE" in capabilities
 
-            blocked = await self._blocked_uids(imap, email_ids, allowed_senders)
-            copied: list[str] = []  # allowed UIDs that actually completed COPY+STORE on the fallback path
-            for email_id in email_ids:
-                if email_id in blocked:
-                    (failed_ids if report_blocked_mutations else moved_ids).append(email_id)
-                    continue
-                try:
-                    if has_move:
-                        move_response = await imap.uid("move", email_id, _quote_mailbox(destination_mailbox))
-                        _raise_for_imap_error(move_response, f"MOVE email {email_id}")
-                    else:
-                        copy_response = await imap.uid("copy", email_id, _quote_mailbox(destination_mailbox))
-                        _raise_for_imap_error(copy_response, f"COPY email {email_id}")
-                        store_response = await imap.uid("store", email_id, "+FLAGS", r"(\Deleted)")
-                        _raise_for_imap_error(store_response, f"STORE \\Deleted for email {email_id}")
-                        copied.append(email_id)
-                    moved_ids.append(email_id)
-                except Exception as e:
-                    logger.error(f"Failed to move email {email_id}: {e}")
-                    failed_ids.append(email_id)
+            unique_email_ids = list(dict.fromkeys(email_ids))
+            blocked = await self._blocked_uids(imap, unique_email_ids, allowed_senders)
+            permitted_ids = [email_id for email_id in unique_email_ids if email_id not in blocked]
+            for email_id in blocked:
+                (failed_ids if report_blocked_mutations else moved_ids).append(email_id)
 
-            if copied:  # only expunge when real COPY+STORE happened — never for blocked/no-op UIDs
-                try:
-                    expunge_response = await imap.expunge()
-                    _raise_for_imap_error(expunge_response, "EXPUNGE moved emails")
-                except Exception as e:
-                    logger.error(f"Failed to expunge moved emails: {e}")
-                    failed_ids.extend(copied)
-                    moved_ids = [uid for uid in moved_ids if uid not in set(copied)]
+            # Reject the COPY+DELETE fallback before COPY unless its exact source
+            # UIDs can be expunged. This prevents both duplicate destinations and
+            # mailbox-wide deletion of another client's \Deleted messages.
+            if permitted_ids and not has_move and not _supports_uid_expunge(imap):
+                logger.warning("Refusing COPY+DELETE move fallback because the server does not advertise UIDPLUS")
+                failed_ids.extend(permitted_ids)
+            else:
+                copied: list[str] = []
+                for email_id in permitted_ids:
+                    try:
+                        if has_move:
+                            move_response = await imap.uid("move", email_id, _quote_mailbox(destination_mailbox))
+                            _raise_for_imap_error(move_response, f"MOVE email {email_id}")
+                        else:
+                            copy_response = await imap.uid("copy", email_id, _quote_mailbox(destination_mailbox))
+                            _raise_for_imap_error(copy_response, f"COPY email {email_id}")
+                            store_response = await imap.uid("store", email_id, "+FLAGS", r"(\Deleted)")
+                            _raise_for_imap_error(store_response, f"STORE \\Deleted for email {email_id}")
+                            copied.append(email_id)
+                        moved_ids.append(email_id)
+                    except Exception as e:
+                        logger.error(f"Failed to move email {email_id}: {e}")
+                        failed_ids.append(email_id)
+
+                if copied:
+                    try:
+                        await _uid_expunge(imap, copied, "UID EXPUNGE moved emails")
+                    except Exception as e:
+                        logger.error(f"Failed to expunge moved emails: {e}")
+                        copied_set = set(copied)
+                        failed_ids.extend(copied)
+                        moved_ids = [uid for uid in moved_ids if uid not in copied_set]
         finally:
             try:
                 await imap.logout()
-            except Exception as e:
-                logger.info(f"Error during logout: {e}")
+            except Exception:
+                logger.info("IMAP logout failed")
 
-        return moved_ids, failed_ids
+        moved_set = set(moved_ids)
+        failed_set = set(failed_ids)
+        return (
+            [email_id for email_id in email_ids if email_id in moved_set],
+            [email_id for email_id in email_ids if email_id in failed_set],
+        )
 
     async def list_mailboxes(self, pattern: str = "*", reference: str = "") -> list[MailboxInfo]:
         """List available IMAP mailboxes with flags and delimiter."""
@@ -1781,8 +2726,8 @@ class EmailClient:
         finally:
             try:
                 await imap.logout()
-            except Exception as e:
-                logger.info(f"Error during logout: {e}")
+            except Exception:
+                logger.info("IMAP logout failed")
 
         return mailboxes
 
@@ -1857,6 +2802,7 @@ class ClassicEmailHandler(EmailHandler):
         before fetching the body, so a blocked message is never read or marked and returns None —
         indistinguishable from a missing/inaccessible one (both land in failed_ids).
         """
+        del mark_as_read  # The MCP/application adapter sequences this separate mutation.
         allowed_senders = get_settings().allowed_senders
         emails = []
         failed_ids = []
@@ -1866,7 +2812,7 @@ class ClassicEmailHandler(EmailHandler):
                 email_data = await self.incoming_client.get_email_body_by_id(
                     email_id,
                     mailbox,
-                    mark_as_read,
+                    False,
                     allowed_senders=allowed_senders,
                     body_offset=body_offset,
                     max_body_length=max_body_length,

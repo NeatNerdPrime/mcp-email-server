@@ -8,22 +8,65 @@
 An MCP server for reading, searching, organizing, and sending email through
 IMAP and SMTP.
 
+> [!NOTE]
+> Version 1.0.0 introduces Local Email App V2. Updating the package does not
+> automatically import existing settings created with PyPI 0.16.0 and earlier:
+> they remain active in backward-compatible `legacy` mode, so there is no required
+> migration. If you
+> would like to use the new managed storage, you can review and import those
+> settings whenever it is convenient.
+
+## Optional migration for existing installations
+
+An `@latest` release that includes Local Email App V2 offers a preview-first
+CLI migration:
+
+```bash
+uvx mcp-email-server@latest config init \
+  --database ~/.config/mcp-email-server/managed.sqlite3
+uvx mcp-email-server@latest config import-legacy
+uvx mcp-email-server@latest config import-legacy --apply
+uvx mcp-email-server@latest config doctor
+```
+
+The apply step displays the plan again and asks for `IMPORT` confirmation. A
+complete import selects managed mode; otherwise the existing legacy settings
+remain selected. The source TOML file and its legacy keyring entries are left
+untouched. You can also run `uvx mcp-email-server@latest ui` and choose **Import
+existing settings**. After a successful import, restart running MCP clients. See
+the detailed [upgrade guidance](docs/getting-started.md#upgrading-to-local-email-app-v2)
+and [import troubleshooting](docs/troubleshooting.md#legacy-import-reports-a-conflict-or-missing-credential).
+
 ## Quick start
 
 ### 1. Configure an email account
 
-Run the configuration UI with [`uv`](https://docs.astral.sh/uv/):
+From this source checkout, run the configuration UI with
+[`uv`](https://docs.astral.sh/uv/):
 
 ```bash
-uvx mcp-email-server@latest ui
+uv sync
+uv run mcp-email-server ui
 ```
 
-Add your IMAP account in the browser window. SMTP is optional if the account
-does not need to send email.
+For a published release whose notes state that it includes Local Email App V2,
+`uvx mcp-email-server@latest ui` is the equivalent temporary invocation.
+
+Keep the foreground command running. On a truly empty installation, the
+authenticated browser session prepares private account storage at the safe local
+default; existing TOML or environment configuration instead offers an explicit
+import review while the previous settings keep running. The account-first UI has
+only **Email accounts** and **Settings & help** as primary destinations. Start
+with the email address and password; the UI fills common connection settings from
+the email domain and keeps them editable, while outgoing mail remains optional.
+A saved complete account is ready without a separate activation step. Use
+**Password & test** on the saved account if desired, then restart the MCP client
+to apply the selected settings.
 
 ### 2. Configure the MCP client
 
-Add the following server definition to the MCP client:
+Use the same V2-capable distribution for stdio as for the UI. For a published
+V2 release, add the following server definition to the MCP client:
 
 ```json
 {
@@ -36,7 +79,10 @@ Add the following server definition to the MCP client:
 }
 ```
 
-Restart the MCP client after updating its configuration.
+Restart the MCP client after updating its configuration. When testing this
+source checkout before publication, invoke `uv run --directory
+/absolute/path/to/mcp-email-server mcp-email-server stdio` instead of pairing a
+managed catalog with PyPI `@latest`.
 
 ### 3. Verify the connection
 
@@ -44,9 +90,9 @@ Ask the client to list the configured email accounts or recent messages.
 
 ## Other configuration methods
 
-For headless environments, containers, multiple accounts, custom TLS settings,
-and environment-variable configuration, see the
-[documentation](https://mcp-email-server.wh1isper.top/).
+For the SQLite-backed managed CLI workflow, headless environments, containers,
+multiple accounts, custom TLS settings, and environment-variable configuration,
+see the [documentation](https://mcp-email-server.wh1isper.top/).
 
 ## Documentation
 
