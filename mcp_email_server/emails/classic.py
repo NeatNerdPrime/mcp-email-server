@@ -1770,7 +1770,7 @@ class EmailClient:
         """Compose an email message without sending it.
 
         Builds MIME structure, sets headers (Subject, From, To, Cc, Date,
-        Message-Id, threading headers). Synchronous — no I/O.
+        Message-Id, User-Agent, X-Mailer, and threading headers). Synchronous — no I/O.
 
         When ``include_bcc_header`` is True (used for local IMAP storage such
         as Drafts or Sent copies), the Bcc header is included so mail clients
@@ -1824,6 +1824,11 @@ class EmailClient:
         sender_for_domain = sender_address or self.sender
         sender_domain = sender_for_domain.rsplit("@", 1)[-1].rstrip(">")
         msg["Message-Id"] = email.utils.make_msgid(domain=sender_domain)
+
+        # De-facto sender identification headers improve compatibility with
+        # providers that inspect sender-software identification.
+        msg["User-Agent"] = "mcp-email-server"
+        msg["X-Mailer"] = "mcp-email-server"
 
         return msg
 

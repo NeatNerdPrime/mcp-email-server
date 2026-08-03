@@ -612,6 +612,14 @@ Set `save_to_sent = false` to disable the IMAP append after sending. The
 environment equivalents are `MCP_EMAIL_SERVER_SAVE_TO_SENT` and
 `MCP_EMAIL_SERVER_SENT_FOLDER_NAME`.
 
+## Outgoing message headers
+
+Every outgoing MIME message carries a single top-level `MIME-Version: 1.0`
+header. The server also adds `User-Agent: mcp-email-server` and
+`X-Mailer: mcp-email-server` as de-facto application identifiers for
+compatibility with providers that inspect sender-software identification. These
+identifiers are fixed and contain no account-specific information.
+
 ## Global settings
 
 | Setting                      | Default  | Description                                                                |
