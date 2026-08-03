@@ -6,6 +6,7 @@ import os
 import secrets
 import stat
 from pathlib import Path
+from typing import Any
 
 from mcp_email_server.adapters.authority import resolve_local_account
 from mcp_email_server.application.limits import APPLICATION_LIMITS
@@ -26,6 +27,12 @@ from mcp_email_server.emails.models import (
     EmailBodyResponse,
     EmailContentBatchResponse,
     MailboxInfo,
+)
+from mcp_email_server.windows_security import (
+    WindowsSecurityError,
+    preflight_artifact_destination,
+    windows_security_supported,
+    write_attachment,
 )
 
 
@@ -148,6 +155,11 @@ class ClassicReadProvider:
         )
 
 
+# POSIX-only attributes are absent from Windows typeshed stubs. Keep that
+# dynamic boundary inside this platform adapter.
+_posix_os: Any = os
+
+
 _SECURE_ATTACHMENT_WRITES_SUPPORTED = (
     os.name == "posix"
     and hasattr(os, "O_DIRECTORY")
@@ -155,11 +167,11 @@ _SECURE_ATTACHMENT_WRITES_SUPPORTED = (
     and hasattr(os, "geteuid")
     and all(operation in os.supports_dir_fd for operation in (os.mkdir, os.open, os.rename, os.stat, os.unlink))
     and os.stat in os.supports_follow_symlinks
-)
+) or (os.name == "nt" and windows_security_supported())
 
 
 class LocalArtifactWriter:
-    """Write an exact caller path only when pinned POSIX traversal is available."""
+    """Write an exact caller path through the platform filesystem-security adapter."""
 
     @staticmethod
     def _validate_directory(descriptor: int) -> None:
@@ -169,14 +181,14 @@ class LocalArtifactWriter:
         writable_by_others = stat.S_IMODE(metadata.st_mode) & 0o022
         if writable_by_others and not (metadata.st_mode & stat.S_ISVTX):
             raise PermissionError("Attachment destination parent permissions are unsafe")
-        current_uid = os.geteuid()
+        current_uid = _posix_os.geteuid()
         if metadata.st_uid not in {0, current_uid}:
             raise PermissionError("Attachment destination parent ownership is unsafe")
 
     @staticmethod
     def _open_posix_parent(path: Path) -> int:
         """Open every parent through pinned no-follow directory descriptors."""
-        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        directory_flags = os.O_RDONLY | _posix_os.O_DIRECTORY | _posix_os.O_NOFOLLOW
         directory_descriptor = os.open(path.anchor, directory_flags)
         try:
             LocalArtifactWriter._validate_directory(directory_descriptor)
@@ -223,7 +235,7 @@ class LocalArtifactWriter:
             return
         if not stat.S_ISREG(metadata.st_mode):
             raise PermissionError("Attachment destination must be a regular file")
-        if metadata.st_uid != os.geteuid() or metadata.st_nlink != 1:
+        if metadata.st_uid != _posix_os.geteuid() or metadata.st_nlink != 1:
             raise PermissionError("Attachment destination identity is unsafe")
         if stat.S_IMODE(metadata.st_mode) & 0o077:
             raise PermissionError("Attachment destination permissions are unsafe")
@@ -232,7 +244,7 @@ class LocalArtifactWriter:
     def _validate_written_file(metadata: os.stat_result, *, expected_size: int) -> None:
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
             raise PermissionError("Attachment destination must be a regular file")
-        if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) != 0o600:
+        if metadata.st_uid != _posix_os.geteuid() or stat.S_IMODE(metadata.st_mode) != 0o600:
             raise PermissionError("Attachment destination identity is unsafe")
         if metadata.st_size != expected_size:
             raise PermissionError("Attachment destination size verification failed")
@@ -245,9 +257,9 @@ class LocalArtifactWriter:
         temporary_identity: tuple[int, int] | None = None
         try:
             LocalArtifactWriter._validate_existing_target(parent_descriptor, path.name)
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _posix_os.O_NOFOLLOW
             if hasattr(os, "O_NONBLOCK"):
-                flags |= os.O_NONBLOCK
+                flags |= _posix_os.O_NONBLOCK
             descriptor = os.open(temporary_name, flags, 0o600, dir_fd=parent_descriptor)
             opened = os.fstat(descriptor)
             temporary_identity = (opened.st_dev, opened.st_ino)
@@ -286,6 +298,30 @@ class LocalArtifactWriter:
             os.close(parent_descriptor)
 
     @staticmethod
+    def _preflight(save_path: str) -> None:
+        path = Path(os.path.abspath(Path(save_path).expanduser()))
+        if not _SECURE_ATTACHMENT_WRITES_SUPPORTED:
+            raise PermissionError(
+                "Attachment download is unavailable because this platform cannot enforce secure destination traversal"
+            )
+        try:
+            if os.name == "nt":  # pragma: no cover - native Windows CI
+                preflight_artifact_destination(path)
+                return
+            parent_descriptor = LocalArtifactWriter._open_posix_parent(path)
+            try:
+                LocalArtifactWriter._validate_existing_target(parent_descriptor, path.name)
+            finally:
+                os.close(parent_descriptor)
+        except PermissionError:
+            raise
+        except (OSError, WindowsSecurityError) as exc:
+            raise PermissionError("Attachment destination parent is unsafe") from exc
+
+    async def preflight(self, save_path: str) -> None:
+        await asyncio.to_thread(self._preflight, save_path)
+
+    @staticmethod
     def _write(save_path: str, payload: AttachmentPayload) -> str:
         path = Path(os.path.abspath(Path(save_path).expanduser()))
         if not _SECURE_ATTACHMENT_WRITES_SUPPORTED:
@@ -293,11 +329,14 @@ class LocalArtifactWriter:
                 "Attachment download is unavailable because this platform cannot enforce secure destination traversal"
             )
         try:
-            LocalArtifactWriter._write_posix(path, payload.content)
+            if os.name == "nt":  # pragma: no cover - native Windows CI
+                write_attachment(path, payload.content)
+            else:
+                LocalArtifactWriter._write_posix(path, payload.content)
         except PermissionError:
             raise
-        except OSError as exc:
-            if exc.errno in {errno.EISDIR, errno.ELOOP, errno.ENODEV, errno.ENXIO}:
+        except (OSError, WindowsSecurityError) as exc:
+            if isinstance(exc, OSError) and exc.errno in {errno.EISDIR, errno.ELOOP, errno.ENODEV, errno.ENXIO}:
                 raise PermissionError("Attachment destination must be a regular file") from exc
             raise PermissionError("Attachment destination could not be written") from exc
         return path.as_posix()

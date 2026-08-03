@@ -8,11 +8,12 @@ mcp-email-server supports two explicitly selectable configuration modes:
 
 - `legacy` keeps account configuration in TOML and composes documented
   environment overlays;
-- `managed` keeps account authority in owner-only SQLite. On Linux, credentials
-  default to its dedicated `managed_secret` table; on macOS and other non-Linux
-  platforms that satisfy the required POSIX owner/no-follow/locking guarantees,
-  credentials default to the operating-system keyring. Managed catalogs are not
-  currently supported without those filesystem guarantees.
+- `managed` keeps account authority in private SQLite. On Linux and Windows,
+  credentials default to its dedicated `managed_secret` table. Windows requires
+  a local fixed NTFS catalog protected by handle-bound DACL, reparse, identity,
+  and locking checks. macOS uses the operating-system keyring. Managed catalogs
+  are not
+  supported without the complete platform filesystem-security profile.
 
 A missing configuration file or a v1 TOML source without separate bootstrap
 authority remains `legacy` for backward compatibility. Historical `db_location`
@@ -45,8 +46,10 @@ the TOML suffix: `/path/work.toml` uses `/path/work.bootstrap.toml`.
 
 On first use, if the current file does not exist and a legacy file exists at
 `~/.config/zerolib/mcp_email_server/config.toml`, the legacy file is copied to
-the current location automatically. An explicitly managed file at the old path
-is not copied as an import-time side effect.
+the current location automatically. The destination is created owner-only on
+POSIX and with the protected private DACL on Windows; concurrent destination
+creation is never overwritten. An explicitly managed file at the old path is
+not copied as an import-time side effect.
 
 ## Local management UI
 
@@ -64,8 +67,8 @@ After authentication and status inspection, a truly empty installation issues
 one CSRF-protected POST that prepares `managed.sqlite3` in the same private
 directory as the active source and bootstrap sidecar. The POST rechecks the
 effective legacy source, then binds
-both the zero revision and absent-file proof under the same supported-POSIX lock
-used by legacy settings writes. No GET mutates state.
+both the zero revision and absent-file proof under the same secure cross-process
+platform lock used by legacy settings writes. No GET mutates state.
 If effective TOML/environment legacy content exists, the UI does not initialize
 automatically; **Import existing settings** is an explicit preparation and
 review action. A fresh installation creates the catalog and selects managed mode
@@ -116,9 +119,9 @@ editor.
 The browser process is only an adapter over shared management application
 services. It has no provider-connectivity route, mail, generic RPC, filesystem
 browser, OpenAPI, or MCP App surface. Managed catalog and attachment effects,
-plus oversized-result spill, require the documented POSIX filesystem primitives
-and fail closed when those
-primitives are unavailable. See [Security](security.md#local-management-ui-security)
+plus oversized-result spill, require the documented POSIX or Windows
+filesystem-security profile and fail closed when that complete profile is
+unavailable. See [Security](security.md#local-management-ui-security)
 for its one-time bootstrap, platform, and session boundaries.
 
 ## Managed CLI setup
@@ -287,10 +290,10 @@ IMAP/SMTP authentication and timeout failures retain the correct category.
 
 ### Managed account lifecycle
 
-On Linux, `account add` and `account set-secret` insert the new value into the
-owner-only `managed_secret` table and activate its binding/revision in one SQLite
-transaction. On macOS and other supported POSIX non-Linux platforms, the system keyring
-write precedes one compare-and-swap activation transaction. Any failure before
+On Linux and Windows, `account add` and `account set-secret` insert the new value
+into the private `managed_secret` table and activate its binding/revision in one
+SQLite transaction. On macOS, the system keyring write precedes one
+compare-and-swap activation transaction. Any failure before
 activation returns an error without persisting an intermediate binding or
 changing current binding authority. During rotation, activation first marks the
 old active value `CLEANUP_REQUIRED`; confirmed deletion clears that state, while
@@ -416,9 +419,9 @@ headers needed by the public metadata result. Removing the operational database
 only discards rebuildable observations; it does not remove accounts or mail.
 
 Managed storage uses one exact current schema for account authority, the
-platform-selected secret binding, and the operational projection. On Linux, any
-copy, snapshot, or backup of this database includes plaintext values from
-`managed_secret`; protect every copy with owner-only access equivalent to the
+platform-selected secret binding, and the operational projection. On Linux and
+Windows, any copy, snapshot, or backup of this database includes plaintext values
+from `managed_secret`; protect every copy with private access equivalent to the
 original and never treat the catalog as a non-secret database. There are no
 released managed-catalog users, so pre-release development schemas receive no
 compatibility or automatic-migration promise. Legacy TOML, environment, and

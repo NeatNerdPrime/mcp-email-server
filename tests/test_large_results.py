@@ -46,6 +46,11 @@ def _content_response(body: str) -> EmailContentBatchResponse:
     )
 
 
+def test_large_result_metadata_requires_stable_identity() -> None:
+    with pytest.raises(TypeError, match="stable identity"):
+        large_results_module._metadata_key(object())
+
+
 @pytest.mark.asyncio
 async def test_large_result_writer_fails_closed_lazily_without_owner_only_storage(monkeypatch) -> None:
     monkeypatch.setattr("mcp_email_server.large_results._SECURE_LOCAL_RESULTS_SUPPORTED", False)
@@ -76,6 +81,19 @@ async def test_large_result_writer_creates_private_integrity_checked_artifact() 
 
     await writer.aclose()
     assert not path.exists()
+    assert not root.exists()
+
+
+@pytest.mark.asyncio
+async def test_large_result_writer_removes_root_after_consumer_already_removed_artifact() -> None:
+    writer = LocalLargeResultWriter()
+    reference = await writer.write(prefix="email-content", content=b"consumed")
+    path = Path(reference.output_file_path)
+    root = path.parent
+    path.unlink()
+
+    await writer.aclose()
+
     assert not root.exists()
 
 
@@ -177,6 +195,7 @@ def test_large_result_writer_rejects_invalid_root_and_file_metadata(tmp_path: Pa
         LocalLargeResultWriter._validate_file(wrong_owner, expected_size=4)
 
 
+@pytest.mark.skipif(os.name != "posix", reason="Injected fsync failure is POSIX-specific")
 @pytest.mark.asyncio
 async def test_large_result_writer_removes_partial_artifact_after_write_failure(
     monkeypatch: pytest.MonkeyPatch,
@@ -192,6 +211,7 @@ async def test_large_result_writer_removes_partial_artifact_after_write_failure(
     await writer.aclose()
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX identity injection has native Windows coverage")
 @pytest.mark.asyncio
 async def test_large_result_writer_rejects_artifact_identity_change(monkeypatch: pytest.MonkeyPatch) -> None:
     writer = LocalLargeResultWriter()
@@ -209,6 +229,7 @@ async def test_large_result_writer_rejects_artifact_identity_change(monkeypatch:
     await writer.aclose()
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX temporary-root injection has native Windows coverage")
 def test_large_result_writer_removes_root_when_initial_validation_fails(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -230,6 +251,7 @@ def test_large_result_writer_removes_root_when_initial_validation_fails(
     assert not root.exists()
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX identity metadata has native Windows coverage")
 def test_large_result_writer_rejects_missing_root_identity(tmp_path: Path) -> None:
     writer = LocalLargeResultWriter()
     root = tmp_path / "results"
@@ -240,6 +262,7 @@ def test_large_result_writer_rejects_missing_root_identity(tmp_path: Path) -> No
         writer._ensure_root()
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX identity metadata has native Windows coverage")
 @pytest.mark.asyncio
 async def test_large_result_writer_rejects_root_identity_change() -> None:
     writer = LocalLargeResultWriter()
@@ -252,6 +275,7 @@ async def test_large_result_writer_rejects_root_identity_change() -> None:
     root.rmdir()
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX validation injection has native Windows coverage")
 @pytest.mark.asyncio
 async def test_large_result_writer_close_fails_safe_when_root_disappears(
     monkeypatch: pytest.MonkeyPatch,
@@ -266,6 +290,7 @@ async def test_large_result_writer_close_fails_safe_when_root_disappears(
     root.rmdir()
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX validation injection has native Windows coverage")
 @pytest.mark.asyncio
 async def test_large_result_writer_close_preserves_unverifiable_artifact(
     monkeypatch: pytest.MonkeyPatch,
@@ -291,6 +316,7 @@ async def test_large_result_writer_close_is_idempotent_without_artifacts() -> No
     await writer.aclose()
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX identity metadata has native Windows coverage")
 @pytest.mark.asyncio
 async def test_large_result_writer_close_fails_safe_for_changed_root_identity() -> None:
     writer = LocalLargeResultWriter()

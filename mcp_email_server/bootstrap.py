@@ -11,9 +11,23 @@ import tomllib
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import tomli_w
+
+from mcp_email_server.windows_security import (
+    WindowsSecurityError,
+    atomic_write_private,
+    ensure_private_parent,
+    safe_regular_file_exists,
+    secure_file_lock,
+    validate_private_directory,
+    validate_private_file,
+    windows_security_supported,
+)
+
+# POSIX-only flags are absent from Windows typeshed stubs.
+_posix_os: Any = os
 
 BOOTSTRAP_VERSION = 1
 BOOTSTRAP_LOCK_TIMEOUT_SECONDS = 5.0
@@ -25,7 +39,7 @@ _SECURE_BOOTSTRAP_FILES_SUPPORTED = (
     and hasattr(os, "fchmod")
     and hasattr(os, "getuid")
     and importlib.util.find_spec("fcntl") is not None
-)
+) or (os.name == "nt" and windows_security_supported())
 _LEGACY_BOOTSTRAP_PROCESS_LOCK = threading.Lock()
 
 
@@ -84,6 +98,12 @@ def _require_secure_bootstrap_files() -> None:
 
 def _assert_owner_only_directory(path: Path, *, label: str) -> None:
     _require_secure_bootstrap_files()
+    if os.name == "nt":  # pragma: no cover - native Windows CI
+        try:
+            validate_private_directory(path)
+        except WindowsSecurityError as exc:
+            raise BootstrapError(f"{label} does not satisfy the Windows private-storage policy") from exc
+        return
     current_uid = os.getuid()
     for index, candidate in enumerate((path, *path.parents)):
         try:
@@ -102,8 +122,23 @@ def _assert_owner_only_directory(path: Path, *, label: str) -> None:
             raise BootstrapError(f"{label} ancestor permissions are unsafe: {candidate}")
 
 
+def _windows_safe_file_exists(  # pragma: no cover - native Windows CI
+    path: Path, *, private: bool
+) -> bool:
+    try:
+        return safe_regular_file_exists(path, private=private, private_parent=False)
+    except WindowsSecurityError as exc:
+        raise BootstrapError("Bootstrap path could not be inspected safely on Windows") from exc
+
+
 def _assert_owner_only_file(path: Path, *, label: str) -> None:
     _require_secure_bootstrap_files()
+    if os.name == "nt":  # pragma: no cover - native Windows CI
+        try:
+            validate_private_file(path)
+        except WindowsSecurityError as exc:
+            raise BootstrapError(f"{label} does not satisfy the Windows private-file policy") from exc
+        return
     try:
         metadata = path.lstat()
     except OSError as exc:
@@ -121,9 +156,16 @@ def read_bootstrap(  # noqa: C901
 ) -> Bootstrap:
     source_path = configured_path() if path is None else Path(os.path.abspath(path.expanduser()))
     authority_path = bootstrap_path(source_path)
-    sidecar_exists = authority_path.exists() or authority_path.is_symlink()
+    if os.name == "nt":  # pragma: no cover - native Windows CI
+        sidecar_exists = _windows_safe_file_exists(authority_path, private=True)
+    else:
+        sidecar_exists = authority_path.exists() or authority_path.is_symlink()
     if not sidecar_exists:
-        if not source_path.exists() and not source_path.is_symlink():
+        if os.name == "nt":  # pragma: no cover - native Windows CI
+            source_exists = _windows_safe_file_exists(source_path, private=False)
+        else:
+            source_exists = source_path.exists() or source_path.is_symlink()
+        if not source_exists:
             return Bootstrap(path=source_path, mode="legacy", db_path=None, version=None, revision=0, exists=False)
         try:
             raw = tomllib.loads(source_path.read_text())
@@ -137,8 +179,11 @@ def read_bootstrap(  # noqa: C901
         # The first selection write creates the sidecar without touching this file.
         authority_path = source_path
     else:
-        if authority_path.is_symlink() or not authority_path.is_file():
+        if os.name != "nt" and (authority_path.is_symlink() or not authority_path.is_file()):
             raise BootstrapError(f"Bootstrap configuration must be a regular file and not a symlink: {authority_path}")
+        if os.name == "nt":  # pragma: no cover - native Windows CI
+            _assert_owner_only_directory(authority_path.parent, label="Bootstrap parent")
+            _assert_owner_only_file(authority_path, label="Bootstrap configuration")
         try:
             raw = tomllib.loads(authority_path.read_text())
         except (OSError, UnicodeError, tomllib.TOMLDecodeError) as exc:
@@ -228,6 +273,12 @@ def assert_legacy_writable(operation: str, path: Path | None = None) -> None:
 
 def _ensure_private_parent(path: Path) -> None:
     _require_secure_bootstrap_files()
+    if os.name == "nt":  # pragma: no cover - native Windows CI
+        try:
+            ensure_private_parent(path)
+        except WindowsSecurityError as exc:
+            raise BootstrapError("Bootstrap parent does not satisfy the Windows private-storage policy") from exc
+        return
     parent = path.parent
     if not parent.exists():
         parent.mkdir(mode=0o700, parents=True)
@@ -235,29 +286,28 @@ def _ensure_private_parent(path: Path) -> None:
 
 
 @contextlib.contextmanager
-def bootstrap_file_lock(path: Path, *, require_secure_parent: bool = True) -> Iterator[None]:
-    source_path = Path(os.path.abspath(path.expanduser()))
-    authority_path = bootstrap_path(source_path)
-    if require_secure_parent:
-        # Managed authority writes always require owner-only no-follow files and
-        # a cross-process lock; _ensure_private_parent fails closed otherwise.
-        _ensure_private_parent(authority_path)
-    elif not _SECURE_BOOTSTRAP_FILES_SUPPORTED:
-        # Legacy-only writes predate managed bootstrap requirements. Retain their
-        # platform behavior while serializing this process and without creating a
-        # misleading lock file.
-        with _LEGACY_BOOTSTRAP_PROCESS_LOCK:
+def _windows_bootstrap_lock(  # pragma: no cover - native Windows CI
+    lock_path: Path,
+) -> Iterator[None]:
+    try:
+        with secure_file_lock(lock_path, timeout=BOOTSTRAP_LOCK_TIMEOUT_SECONDS):
             yield
-        return
-    elif not authority_path.parent.exists():
-        # Keep a newly required immediate parent suitable for later managed
-        # initialization; never change an existing legacy directory here.
-        authority_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    lock_path = Path(f"{authority_path}.lock")
+    except WindowsSecurityError as exc:
+        message = (
+            "Bootstrap lock is busy" if "busy" in str(exc).lower() else "Bootstrap lock could not be opened safely"
+        )
+        raise BootstrapError(message) from exc
+
+
+@contextlib.contextmanager
+def _posix_bootstrap_lock(lock_path: Path) -> Iterator[None]:
+    import fcntl as fcntl_module
+
+    posix_fcntl: Any = fcntl_module
     if lock_path.exists() or lock_path.is_symlink():
         _assert_owner_only_file(lock_path, label="Bootstrap lock")
     try:
-        descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR | _posix_os.O_NOFOLLOW, 0o600)
     except OSError as exc:
         raise BootstrapError("Bootstrap lock could not be opened safely") from exc
     try:
@@ -266,12 +316,10 @@ def bootstrap_file_lock(path: Path, *, require_secure_parent: bool = True) -> It
         _assert_owner_only_file(lock_path, label="Bootstrap lock")
         if (opened.st_dev, opened.st_ino) != (checked.st_dev, checked.st_ino):
             raise BootstrapError("Bootstrap lock changed while it was opened")
-        import fcntl
-
         deadline = time.monotonic() + BOOTSTRAP_LOCK_TIMEOUT_SECONDS
         while True:
             try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                posix_fcntl.flock(descriptor, posix_fcntl.LOCK_EX | posix_fcntl.LOCK_NB)
                 break
             except BlockingIOError as exc:
                 if time.monotonic() >= deadline:
@@ -279,14 +327,41 @@ def bootstrap_file_lock(path: Path, *, require_secure_parent: bool = True) -> It
                 time.sleep(0.05)
         yield
     finally:
-        import fcntl
-
-        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        posix_fcntl.flock(descriptor, posix_fcntl.LOCK_UN)
         os.close(descriptor)
+
+
+@contextlib.contextmanager
+def bootstrap_file_lock(path: Path, *, require_secure_parent: bool = True) -> Iterator[None]:
+    source_path = Path(os.path.abspath(path.expanduser()))
+    authority_path = bootstrap_path(source_path)
+    if not require_secure_parent and os.name == "nt":  # pragma: no cover - native Windows CI
+        # Historical legacy-only TOML writes do not establish managed authority.
+        with _LEGACY_BOOTSTRAP_PROCESS_LOCK:
+            yield
+        return
+    if not require_secure_parent and not _SECURE_BOOTSTRAP_FILES_SUPPORTED:
+        with _LEGACY_BOOTSTRAP_PROCESS_LOCK:
+            yield
+        return
+    if require_secure_parent:
+        _ensure_private_parent(authority_path)
+    elif not authority_path.parent.exists():
+        authority_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lock_path = Path(f"{authority_path}.lock")
+    lock = _windows_bootstrap_lock(lock_path) if os.name == "nt" else _posix_bootstrap_lock(lock_path)
+    with lock:
+        yield
 
 
 def _atomic_write(path: Path, content: str) -> None:
     _ensure_private_parent(path)
+    if os.name == "nt":  # pragma: no cover - native Windows CI
+        try:
+            atomic_write_private(path, content.encode("utf-8"), prefix=".mcp-email-bootstrap-")
+        except WindowsSecurityError as exc:
+            raise BootstrapError("Bootstrap configuration could not be replaced safely") from exc
+        return
     fd, temporary_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     try:
         os.fchmod(fd, 0o600)

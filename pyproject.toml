@@ -22,15 +22,18 @@ dependencies = [
     "anyio>=4.5",
     "beautifulsoup4>=4.14.3",
     "click>=8.0.0",
+    "filelock>=3.32.2",
     "jinja2>=3.1.5",
     "keyring>=25.0",
     "loguru>=0.7.3",
     "mcp[cli]>=1.23.0,<2",
     "pydantic>=2.11.0",
     "pydantic-settings[toml]>=2.11.0",
+    "pywin32>=312 ; sys_platform == 'win32'",
     "starlette>=0.40",
     "tomli-w>=1.2.0",
     "typer>=0.15.1",
+    "tzdata>=2025.2 ; sys_platform == 'win32'",
     "uvicorn>=0.30",
 ]
 
@@ -110,6 +113,16 @@ typeCheckingMode = "standard"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
+[tool.deptry.package_module_name_map]
+tzdata = ["zoneinfo"]
+pywin32 = [
+    "ntsecuritycon",
+    "win32api",
+    "win32con",
+    "win32file",
+    "win32security",
+]
+
 [tool.ruff]
 target-version = "py311"
 line-length = 120
@@ -177,4 +190,4 @@ branch = true
 parallel = true
 patch = ["subprocess"]
 source = ["mcp_email_server"]
-omit = ["mcp_email_server/ui.py"]
+omit = ["*/mcp_email_server/ui.py", "*/mcp_email_server/windows_security.py"]

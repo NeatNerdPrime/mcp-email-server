@@ -100,7 +100,7 @@ Required abstract capabilities include:
 - managed catalog queries and compare-and-swap mutations;
 - legacy effective configuration and legacy-only writer;
 - `SecretStore` immutable store/read/delete, including transactional insertion
-  for the Linux managed SQLite implementation;
+  for the Linux and Windows managed SQLite implementations;
 - IMAP mailbox, metadata, body, attachment, append, move, and flag operations;
 - SMTP delivery;
 - metadata projection queries and writes;
@@ -165,7 +165,8 @@ reverse order.
 
 SQLite transactions contain only bounded local database work. Network, system
 keyring, browser opening, and potentially large filesystem effects happen outside
-them. The Linux managed `SecretStore` is the deliberate exception: inserting a
+them. The Linux/Windows managed `SecretStore` is the deliberate exception:
+inserting a
 row into the same database's dedicated `managed_secret` table and activating its
 binding/revision are one bounded SQLite transaction. Workflows spanning an
 external keyring boundary use explicit phases and typed cleanup states rather
@@ -177,7 +178,8 @@ A credential mutation follows:
 2. read current revision and plan bounded work;
 3. for a keyring-backed store, write the immutable new value outside SQLite;
 4. compare-and-swap activation and mark any superseded active value
-   cleanup-required; on Linux, insert the secret in this same transaction;
+   cleanup-required; on Linux and Windows, insert the secret in this same
+   transaction;
 5. on any pre-activation failure, return an error with binding authority
    unchanged and retain no provisional binding;
 6. delete the superseded value outside the activation transaction and clear its
@@ -205,16 +207,22 @@ is an explicit result variant, not an exception to provider/request limits:
   bounded before spill;
 - the artifact directory is allocated lazily on the first spill write, randomly
   named, owner-only, process-scoped, and outside the
-  repository/configuration/catalog trees;
-- files are created no-follow and exclusive with owner-only permissions, have a
-  bounded byte size and integrity digest, and are revalidated after write;
+  repository/configuration/catalog trees; on Windows it must reside on local
+  fixed NTFS and have a protected private DACL;
+- files are created no-follow and exclusive with owner-only permissions or a
+  protected private Windows DACL, have a bounded byte size and integrity digest,
+  and are revalidated by held-object identity after write;
 - the inline DTO contains only a bounded preview/status, exact artifact path,
   media type, byte count, digest, and process-lifetime notice;
 - no generic file-read, file-listing, download route, or remote URL is added;
   an already-authorized local MCP host may inspect the returned path through its
   own filesystem capability;
-- graceful shutdown removes artifacts and their private directory; startup MAY
-  perform bounded, ownership-verified cleanup of stale crash remnants;
+- graceful shutdown removes only identity-verified artifacts and their private
+  directory; each Windows root holds a process-lifetime owner-marker byte-range
+  lock, and startup cleanup must acquire it non-blocking before age can qualify a
+  candidate, so a live long-running process is never treated as stale; cleanup
+  remains bounded and prefix-, type-, ownership/DACL-, and identity-verified and
+  never follows POSIX links or Windows reparse points;
 - secret values are never eligible for spill, while message content retains the
   same local sensitivity classification as an inline result.
 
@@ -244,12 +252,14 @@ protocol evidence and reports unknown when cancellation prevents certainty.
 5. Direct application calls and all three adapters enforce the same limits and
    validation semantics.
 6. Network, system-keyring, and attachment writes do not execute inside SQLite
-   transactions; the Linux `managed_secret` insert is atomic with binding
-   activation and revision.
+   transactions; the Linux/Windows `managed_secret` insert is atomic with
+   binding activation and revision.
 7. Lazy composition, startup unwind, operation scopes, and repeated shutdown are
    covered without claiming nonexistent long-lived ownership.
 8. Architecture and catalog tests prove no MCP adapter or service registration
    path exposes account or credential management in either mode.
 9. Oversized-result tests prove bounded inline output, private no-follow
-   artifacts, digest/size integrity, process cleanup, spill-failure behavior, and
-   absence of a generic file or remote-download surface.
+   artifacts, digest/size and held identity integrity, process and killed-process
+   stale cleanup, spill-failure behavior, and absence of a generic file or
+   remote-download surface. Native Windows cases run on local NTFS and cover
+   DACLs, reparse points, and cleanup substitution attempts.

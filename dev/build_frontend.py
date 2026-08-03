@@ -16,6 +16,8 @@ STATIC = REPOSITORY / "mcp_email_server" / "web_ui" / "static"
 MANIFEST = FRONTEND / "embedded-assets.json"
 ASSET_REFERENCE = re.compile(r"(?:src|href)=[\"']\./([^\"']+)[\"']")
 _GENERATED_DIRECTORIES = {"coverage", "dist", "node_modules", "playwright-report", "test-results"}
+_TEXT_SOURCE_NAMES = {".gitignore", ".nvmrc"}
+_TEXT_SOURCE_SUFFIXES = {".css", ".html", ".js", ".json", ".md", ".py", ".ts", ".tsx"}
 _MANIFEST_VERSION = 1
 
 
@@ -59,6 +61,12 @@ def _validated_static() -> dict[str, bytes]:
     return _validate_assets(_files(STATIC), packaged=True)
 
 
+def _portable_source_bytes(path: Path) -> bytes:
+    content = path.read_bytes()
+    is_text = path.name in _TEXT_SOURCE_NAMES or path.suffix.lower() in _TEXT_SOURCE_SUFFIXES
+    return content.replace(b"\r\n", b"\n") if is_text else content
+
+
 def _frontend_sources() -> dict[str, bytes]:
     sources: dict[str, bytes] = {}
     for path in sorted(FRONTEND.rglob("*")):
@@ -69,8 +77,8 @@ def _frontend_sources() -> dict[str, bytes]:
             continue
         if relative.parts[0] in _GENERATED_DIRECTORIES or path.name.endswith(".tsbuildinfo"):
             continue
-        sources[f"frontend/{relative.as_posix()}"] = path.read_bytes()
-    sources["dev/build_frontend.py"] = Path(__file__).read_bytes()
+        sources[f"frontend/{relative.as_posix()}"] = _portable_source_bytes(path)
+    sources["dev/build_frontend.py"] = _portable_source_bytes(Path(__file__))
     return sources
 
 
@@ -112,8 +120,12 @@ def _verify_manifest(files: dict[str, bytes]) -> None:
         raise RuntimeError("embedded frontend manifest has an invalid shape")
     if manifest["version"] != _MANIFEST_VERSION:
         raise RuntimeError("embedded frontend manifest version is unsupported")
-    if manifest["source_sha256"] != _digest(_frontend_sources()):
-        raise RuntimeError("frontend sources differ from the staged asset manifest; run `make frontend`")
+    source_digest = _digest(_frontend_sources())
+    if manifest["source_sha256"] != source_digest:
+        raise RuntimeError(
+            "frontend sources differ from the staged asset manifest; "
+            f"expected {manifest['source_sha256']}, got {source_digest}; run `make frontend`"
+        )
     if manifest["assets"] != _asset_hashes(files):
         raise RuntimeError("packaged frontend assets differ from the staged asset manifest; run `make frontend`")
 

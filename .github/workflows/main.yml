@@ -133,6 +133,58 @@ jobs:
       - name: Run GreenMail E2E baseline
         run: make test-e2e
 
+  windows-native:
+    name: Native Windows NTFS security and full runtime
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      MCP_EMAIL_SERVER_REQUIRE_WINDOWS_SYMLINK_TESTS: "1"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out
+        uses: actions/checkout@v6
+
+      - name: Set up the environment
+        uses: ./.github/actions/setup-python-env
+        with:
+          python-version: "3.13"
+
+      - name: Prepare a protected Windows test workspace
+        run: |
+          uv run --python 3.13 python - <<'PY'
+          import os
+          from pathlib import Path
+
+          from mcp_email_server.windows_security import ensure_private_parent
+
+          container = Path(os.environ["RUNNER_TEMP"]) / "mcp-email-server-tests"
+          ensure_private_parent(container / "placeholder")
+          values = {
+              "MCP_EMAIL_SERVER_CONFIG_PATH": (container / "config.toml").as_posix(),
+              "MCP_EMAIL_SERVER_WINDOWS_PYTEST_ROOT": (container / "pytest").as_posix(),
+          }
+          with Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8") as environment:
+              for key, value in values.items():
+                  environment.write(f"{key}={value}\n")
+          PY
+
+      - name: Run the full Python suite on Windows
+        run: >-
+          uv run --python 3.13 python -m pytest --no-cov
+          --basetemp "$MCP_EMAIL_SERVER_WINDOWS_PYTEST_ROOT" tests
+
+      - name: Re-run native NTFS security cases with explicit reporting
+        run: >-
+          uv run --python 3.13 python -m pytest --no-cov -vv
+          --basetemp "$MCP_EMAIL_SERVER_WINDOWS_PYTEST_ROOT" tests/test_windows_security.py
+
+      - name: Check typing with Windows-only dependencies installed
+        run: uv run --python 3.13 python -m pyright
+
   tests-and-type-check:
     runs-on: ubuntu-latest
     strategy:
