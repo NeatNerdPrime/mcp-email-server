@@ -24,7 +24,13 @@ from typing import Any, cast
 
 import aioimaplib
 import aiosmtplib
-from aiosmtplib.errors import SMTPNotSupported, SMTPRecipientRefused, SMTPResponseException
+from aiosmtplib.errors import (
+    SMTPNotSupported,
+    SMTPRecipientRefused,
+    SMTPResponseException,
+    SMTPServerDisconnected,
+    SMTPTimeoutError,
+)
 from bs4 import BeautifulSoup
 
 from mcp_email_server.application.limits import APPLICATION_LIMITS, validate_imap_uid
@@ -659,6 +665,19 @@ async def _imap_starttls(imap: aioimaplib.IMAP4, ssl_context: ssl.SSLContext, ho
 
 # Backwards-compatible alias
 _create_smtp_ssl_context = _create_ssl_context
+
+
+def _smtp_error_category(error: Exception) -> str:
+    """Map an SMTP transport exception to a bounded, non-sensitive category."""
+    if isinstance(error, (SMTPTimeoutError, TimeoutError)):
+        return "timeout"
+    if isinstance(error, (SMTPServerDisconnected, ConnectionError)):
+        return "connection"
+    if isinstance(error, ssl.SSLError):
+        return "tls"
+    if isinstance(error, OSError):
+        return "io"
+    return "unexpected"
 
 
 class EmailClient:
@@ -1876,6 +1895,7 @@ class EmailClient:
                 mail_options.append("BODY=8BITMIME")
             policy = SMTPUTF8_POLICY if utf8_required else SMTP_POLICY
             message_bytes = msg.as_bytes(policy=policy)
+            logger.debug("SMTP phase=message outcome=prepared")
             if smtp.supports_extension("size"):
                 mail_options.insert(0, f"SIZE={len(message_bytes)}")
 
@@ -1890,12 +1910,23 @@ class EmailClient:
                     tuple(TargetMutationOutcome(target, "failed", "smtp-mail-cancelled") for target in all_recipients),
                     None,
                 )
-            except (SMTPResponseException, SMTPNotSupported):
+            except SMTPResponseException as error:
+                logger.warning("SMTP phase=mail outcome=rejected code={}", error.code)
                 return DeliveryMutationOutcome(
                     tuple(TargetMutationOutcome(target, "failed", "smtp-mail-rejected") for target in all_recipients),
                     None,
                 )
-            except Exception:
+            except SMTPNotSupported:
+                logger.warning("SMTP phase=mail outcome=unsupported")
+                return DeliveryMutationOutcome(
+                    tuple(TargetMutationOutcome(target, "failed", "smtp-mail-rejected") for target in all_recipients),
+                    None,
+                )
+            except Exception as error:
+                logger.warning(
+                    "SMTP phase=mail outcome=unavailable category={}",
+                    _smtp_error_category(error),
+                )
                 return DeliveryMutationOutcome(
                     tuple(
                         TargetMutationOutcome(target, "failed", "smtp-mail-unavailable") for target in all_recipients
@@ -1919,9 +1950,14 @@ class EmailClient:
                             all_recipients[remaining_index], "failed", "not-attempted"
                         )
                     return DeliveryMutationOutcome(tuple(item for item in outcomes if item is not None), None)
-                except (SMTPRecipientRefused, SMTPResponseException):
+                except (SMTPRecipientRefused, SMTPResponseException) as error:
+                    logger.warning("SMTP phase=rcpt outcome=rejected code={}", error.code)
                     outcomes[index] = TargetMutationOutcome(target, "failed", "smtp-recipient-rejected")
-                except Exception:
+                except Exception as error:
+                    logger.warning(
+                        "SMTP phase=rcpt outcome=unavailable category={}",
+                        _smtp_error_category(error),
+                    )
                     for accepted_index in accepted_indexes:
                         outcomes[accepted_index] = TargetMutationOutcome(
                             all_recipients[accepted_index], "failed", "smtp-session-lost-before-data"
@@ -1944,10 +1980,15 @@ class EmailClient:
             except asyncio.CancelledError:
                 accepted_status = "unknown"
                 accepted_detail = "smtp-data-unknown"
-            except SMTPResponseException:
+            except SMTPResponseException as error:
+                logger.warning("SMTP phase=data outcome=rejected code={}", error.code)
                 accepted_status = "failed"
                 accepted_detail = "smtp-data-rejected"
-            except Exception:
+            except Exception as error:
+                logger.warning(
+                    "SMTP phase=data outcome=unknown category={}",
+                    _smtp_error_category(error),
+                )
                 accepted_status = "unknown"
                 accepted_detail = "smtp-data-unknown"
             else:
@@ -1965,6 +2006,7 @@ class EmailClient:
             )
 
         known_outcome: DeliveryMutationOutcome | None = None
+        session_phase = "connect"
         try:
             async with aiosmtplib.SMTP(
                 hostname=self.email_server.host,
@@ -1973,15 +2015,35 @@ class EmailClient:
                 use_tls=self.smtp_use_tls,
                 tls_context=self._get_smtp_ssl_context(),
             ) as smtp:
+                logger.debug("SMTP phase=connect outcome=succeeded")
+                session_phase = "authenticate"
                 await smtp.login(self.email_server.user_name, self.email_server.password.get_secret_value())
+                logger.debug("SMTP phase=authenticate outcome=succeeded")
+                session_phase = "transaction"
                 known_outcome = await submit(smtp)
+                session_phase = "cleanup"
         except asyncio.CancelledError:
             # Cancellation while closing a completed transaction must not erase
             # DATA evidence. Setup cancellation still propagates to the caller.
             if known_outcome is not None:
+                logger.debug("SMTP phase=cleanup outcome=cancelled")
                 return known_outcome
             raise
-        except Exception:
+        except SMTPResponseException as error:
+            logger.warning(
+                "SMTP phase={} outcome=rejected code={}",
+                session_phase,
+                error.code,
+            )
+            if known_outcome is not None:
+                return known_outcome
+            raise
+        except Exception as error:
+            logger.warning(
+                "SMTP phase={} outcome=error category={}",
+                session_phase,
+                _smtp_error_category(error),
+            )
             # QUIT is cleanup: once a phase outcome exists, a close failure
             # cannot change SMTP delivery evidence.
             if known_outcome is not None:
@@ -2007,24 +2069,40 @@ class EmailClient:
         msg = self.compose_message(
             recipients, subject, body, cc, bcc, html, attachments, in_reply_to, references, False, reply_to
         )
+        all_recipients = [*recipients, *(cc or []), *(bcc or [])]
+        session_phase = "connect"
 
-        async with aiosmtplib.SMTP(
-            hostname=self.email_server.host,
-            port=self.email_server.port,
-            start_tls=self.smtp_start_tls,
-            use_tls=self.smtp_use_tls,
-            tls_context=self._get_smtp_ssl_context(),
-        ) as smtp:
-            await smtp.login(self.email_server.user_name, self.email_server.password.get_secret_value())
-
-            # Create a combined list of all recipients for delivery
-            all_recipients = recipients.copy()
-            if cc:
-                all_recipients.extend(cc)
-            if bcc:
-                all_recipients.extend(bcc)
-
-            await smtp.send_message(msg, recipients=all_recipients)
+        try:
+            async with aiosmtplib.SMTP(
+                hostname=self.email_server.host,
+                port=self.email_server.port,
+                start_tls=self.smtp_start_tls,
+                use_tls=self.smtp_use_tls,
+                tls_context=self._get_smtp_ssl_context(),
+            ) as smtp:
+                logger.debug("SMTP phase=connect outcome=succeeded")
+                session_phase = "authenticate"
+                await smtp.login(self.email_server.user_name, self.email_server.password.get_secret_value())
+                logger.debug("SMTP phase=authenticate outcome=succeeded")
+                session_phase = "send"
+                logger.debug("SMTP phase=send outcome=started")
+                await smtp.send_message(msg, recipients=all_recipients)
+                logger.debug("SMTP phase=send outcome=succeeded")
+                session_phase = "cleanup"
+        except SMTPResponseException as error:
+            logger.warning(
+                "SMTP phase={} outcome=rejected code={}",
+                session_phase,
+                error.code,
+            )
+            raise
+        except Exception as error:
+            logger.warning(
+                "SMTP phase={} outcome=error category={}",
+                session_phase,
+                _smtp_error_category(error),
+            )
+            raise
 
         # Return the message for potential saving to Sent folder
         return msg
