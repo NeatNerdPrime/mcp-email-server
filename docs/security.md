@@ -114,6 +114,13 @@ backups include plaintext `managed_secret.secret_value` values. Keep every copy
 under protection equivalent to the private original; do not upload, share, or
 treat it as a non-secret account database.
 
+The declared v3-to-v4 catalog migration runs only after the existing catalog and
+sidecars pass the same private-file checks as a normal managed open. One bounded
+SQLite write transaction validates the exact v3 schema, adds default-disabled
+attachment content and empty tag mappings, validates the resulting v4 schema and
+invariants, and records version 4 last. It neither selects nor copies secret
+values; failure rolls back without changing the advertised schema version.
+
 A create or rotation stores a new immutable value and commits it as active only
 if the reviewed account revision still matches. On Linux and Windows, inserting
 `managed_secret`, activating its binding, incrementing the binding/account
@@ -311,6 +318,24 @@ No HTTP route, generic MCP file
 reader, directory listing, remote URL, or arbitrary path lookup is exposed by
 this feature. Only connect a local MCP client whose own filesystem tools may
 legitimately inspect paths returned by the server.
+
+## Semantic tags and embedded attachments
+
+Semantic tag mappings are non-secret account configuration, but their names and
+provider keywords can reveal mailbox organization. Legacy mode stores them with
+the account in the private TOML configuration; managed mode stores them with the
+account in the private catalog. Tag writes require `writable=true` and accept
+semantic names only. The workflow never modifies standard flags, read-only
+configured tags, or unrelated provider keywords.
+
+`get_attachment_content` does not create a local artifact, but it transfers the
+original decoded bytes through MCP and therefore exposes private message content
+to the connected MCP client. It has an independent
+`enable_attachment_content=true` policy and rechecks current authority after
+fetch. Enabling `download_attachment` does not enable content transfer. Use the
+content mode for a trusted remote client, such as a ChatGPT app, that cannot read
+server-local paths. The complete encoded tool result remains subject to the
+existing global serialized-result ceiling.
 
 ## Indexed metadata privacy
 

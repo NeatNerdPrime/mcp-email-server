@@ -114,13 +114,19 @@ sidecar itself is unparseable, repair or restore that sidecar manually; `reset`
 cannot safely infer its mode and therefore does not unlink the independent legacy
 source.
 
-There are no released managed-catalog users for this pre-release redesign, so
-older development catalog schemas are rejected rather than migrated. While
-legacy mode is selected, preserve the old file for rollback and initialize a
-fresh owner-only path with `mcp-email-server config init --database NEW_PATH`.
-Then re-enter accounts or use the reviewed legacy import flow. Fresh setup
-selects managed immediately; an existing v1 source remains selected until a
-complete import succeeds. Remove the obsolete development catalog only after verifying the
+Schema v3 is the only supported pre-release managed-catalog migration source.
+The first v4 open performs that migration transactionally, preserving account,
+policy, binding, and secret rows while initializing empty tag mappings and a
+disabled attachment-content policy. If startup was attempted before upgrading
+the application, restart it after checking out the v4-capable version. A failed
+migration rolls back without advertising v4.
+
+Other older development schemas are still rejected. For those versions, select
+legacy mode, preserve the old file for rollback, and initialize a fresh
+owner-only path with `mcp-email-server config init --database NEW_PATH`. Then
+re-enter accounts or use the reviewed legacy import flow. Fresh setup selects
+managed immediately; an existing v1 source remains selected until a complete
+import succeeds. Remove an obsolete development catalog only after verifying the
 replacement; on Linux and Windows, treat every old catalog copy as
 secret-bearing.
 
@@ -436,6 +442,22 @@ only for a trusted local endpoint with a known self-signed certificate.
 
 For ProtonMail Bridge, copy the host, ports, username, and password shown by the
 bridge rather than using the normal account password.
+
+## Attachment content is unavailable to a remote MCP client
+
+`download_attachment` returns a path on the server machine. A ChatGPT app or
+other remote MCP client cannot read that path because it does not share the
+server filesystem. Enable the independent content-transfer mode instead:
+
+```toml
+enable_attachment_content = true
+```
+
+Or set `MCP_EMAIL_SERVER_ENABLE_ATTACHMENT_CONTENT=true`. In managed mode, use
+the **Allow attachments to be returned through MCP** checkbox. Then call
+`get_attachment_content`. If the encoded resource exceeds the existing global
+serialized-result ceiling, use a smaller attachment; the server does not create
+a temporary URL or split the blob into chunks.
 
 ## Attachment download is denied
 
