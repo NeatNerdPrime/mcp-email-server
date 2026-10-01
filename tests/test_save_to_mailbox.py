@@ -499,4 +499,5 @@ class TestSaveToMailboxTool:
             None,
             None,
             [r"\Draft", r"\Seen"],
+            inline_images=None,
         )

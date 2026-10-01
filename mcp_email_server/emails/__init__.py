@@ -67,6 +67,7 @@ class EmailHandler(abc.ABC):
         in_reply_to: str | None = None,
         references: str | None = None,
         reply_to: str | None = None,
+        inline_images: list[dict[str, str]] | None = None,
     ) -> None:
         """
         Send email
@@ -82,6 +83,8 @@ class EmailHandler(abc.ABC):
             in_reply_to: Message-ID of the email being replied to (for threading).
             references: Space-separated Message-IDs for the thread chain.
             reply_to: Address to set as Reply-To header (overrides From for replies).
+            inline_images: Inline images embedded via Content-ID references
+                (each a {"path": ..., "cid": ...} dict). Requires html=True.
         """
 
     @abc.abstractmethod
@@ -98,6 +101,7 @@ class EmailHandler(abc.ABC):
         in_reply_to: str | None = None,
         references: str | None = None,
         flags: list[str] | None = None,
+        inline_images: list[dict[str, str]] | None = None,
     ) -> str:
         """Compose an email and save it to the specified IMAP folder via APPEND."""
 

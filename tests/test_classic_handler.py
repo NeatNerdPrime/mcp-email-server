@@ -186,6 +186,7 @@ class TestClassicEmailHandler:
                 None,
                 None,
                 None,
+                inline_images=None,
             )
 
     @pytest.mark.asyncio
@@ -220,6 +221,7 @@ class TestClassicEmailHandler:
                 None,
                 None,
                 None,
+                inline_images=None,
             )
 
     @pytest.mark.asyncio

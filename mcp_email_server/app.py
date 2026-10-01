@@ -191,6 +191,19 @@ async def send_email(
             description="A list of absolute file paths to attach to the email. Supports common file types (documents, images, archives, etc.).",
         ),
     ] = None,
+    inline_images: Annotated[
+        list[dict[str, str]] | None,
+        Field(
+            default=None,
+            description=(
+                "Inline images to embed in an HTML body via Content-ID "
+                "references, avoiding base64 in the body text. Each item: "
+                "{'path': '/absolute/path/to/logo.png', 'cid': 'logo'}. "
+                'Reference in the HTML body as <img src="cid:logo">. '
+                "Requires html=True."
+            ),
+        ),
+    ] = None,
     in_reply_to: Annotated[
         str | None,
         Field(
@@ -225,6 +238,7 @@ async def send_email(
         in_reply_to,
         references,
         reply_to,
+        inline_images=inline_images,
     )
     recipient_str = ", ".join(recipients)
     attachment_info = f" with {len(attachments)} attachment(s)" if attachments else ""
@@ -268,6 +282,19 @@ async def save_to_mailbox(
             description="A list of absolute file paths to attach to the email.",
         ),
     ] = None,
+    inline_images: Annotated[
+        list[dict[str, str]] | None,
+        Field(
+            default=None,
+            description=(
+                "Inline images to embed in an HTML body via Content-ID "
+                "references, avoiding base64 in the body text. Each item: "
+                "{'path': '/absolute/path/to/logo.png', 'cid': 'logo'}. "
+                'Reference in the HTML body as <img src="cid:logo">. '
+                "Requires html=True."
+            ),
+        ),
+    ] = None,
     in_reply_to: Annotated[
         str | None,
         Field(
@@ -303,6 +330,7 @@ async def save_to_mailbox(
         in_reply_to,
         references,
         flags,
+        inline_images=inline_images,
     )
     # result format: "<message-id>|uid:<imap-uid>"
     parts = result.split("|uid:")

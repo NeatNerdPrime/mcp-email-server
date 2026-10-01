@@ -10,6 +10,7 @@ import unicodedata
 from datetime import datetime, timezone
 from email.header import Header
 from email.mime.application import MIMEApplication
+from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.parser import BytesParser
@@ -1115,6 +1116,86 @@ class EmailClient:
 
         return msg
 
+    def _create_inline_image_part(self, path: Path, cid: str) -> MIMEImage | MIMEApplication:
+        """Create a Content-ID referenced inline MIME part from a file."""
+        with open(path, "rb") as f:
+            file_data = f.read()
+
+        mime_type, _ = mimetypes.guess_type(str(path))
+        if mime_type is None:
+            mime_type = "application/octet-stream"
+
+        main_type, _, sub_type = mime_type.partition("/")
+        image_part: MIMEImage | MIMEApplication
+        if main_type == "image":
+            image_part = MIMEImage(file_data, _subtype=sub_type)
+        else:
+            image_part = MIMEApplication(file_data, _subtype=sub_type or "octet-stream")
+
+        image_part.add_header("Content-ID", f"<{cid}>")
+        image_part.add_header("Content-Disposition", "inline", filename=path.name)
+        logger.info(f"Embedded inline image: {path.name} (cid={cid}, {mime_type})")
+        return image_part
+
+    def _create_message_with_inline_images(
+        self,
+        body: str,
+        attachments: list[str] | None,
+        inline_images: list[dict[str, str]],
+    ) -> MIMEMultipart:
+        """Create a multipart/related message with CID-referenced inline images.
+
+        When regular attachments are also provided, the multipart/related part
+        is nested as the first child of an outer multipart/mixed, so clients
+        that don't render the related part still see the attachments as
+        attachments.
+        """
+        related = MIMEMultipart("related")
+        related.attach(MIMEText(body, "html", "utf-8"))
+
+        for image in inline_images:
+            try:
+                path = self._validate_attachment(image["path"])
+                related.attach(self._create_inline_image_part(path, image["cid"]))
+            except Exception as e:
+                logger.error(f"Failed to embed inline image {image.get('path')}: {e}")
+                raise
+
+        if not attachments:
+            return related
+
+        mixed = MIMEMultipart("mixed")
+        mixed.attach(related)
+        for file_path in attachments:
+            try:
+                path = self._validate_attachment(file_path)
+                attachment_part = self._create_attachment_part(path)
+                mixed.attach(attachment_part)
+            except Exception as e:
+                logger.error(f"Failed to attach file {file_path}: {e}")
+                raise
+
+        return mixed
+
+    def _build_message_body(
+        self,
+        body: str,
+        html: bool,
+        attachments: list[str] | None,
+        inline_images: list[dict[str, str]] | None,
+    ) -> MIMEText | MIMEMultipart:
+        """Build the MIME body (text, attachments, and/or inline images)."""
+        if inline_images:
+            if not html:
+                msg_text = "inline_images requires html=True (CID references only apply to HTML bodies)"
+                raise ValueError(msg_text)
+            return self._create_message_with_inline_images(body, attachments, inline_images)
+        if attachments:
+            return self._create_message_with_attachments(body, html, attachments)
+
+        content_type = "html" if html else "plain"
+        return MIMEText(body, content_type, "utf-8")
+
     def compose_message(
         self,
         recipients: list[str],
@@ -1128,6 +1209,7 @@ class EmailClient:
         references: str | None = None,
         include_bcc_header: bool = False,
         reply_to: str | None = None,
+        inline_images: list[dict[str, str]] | None = None,
     ) -> MIMEText | MIMEMultipart:
         """Compose an email message without sending it.
 
@@ -1139,12 +1221,13 @@ class EmailClient:
         can display the BCC recipients.  When False (default, used for SMTP
         sending), the Bcc header is omitted — BCC recipients are delivered
         via the SMTP envelope only.
+
+        ``inline_images``, when provided, embeds each image via a
+        Content-ID reference instead of requiring base64 image data in
+        ``body`` — only a local file path travels through this call.
+        Requires ``html=True``.
         """
-        if attachments:
-            msg = self._create_message_with_attachments(body, html, attachments)
-        else:
-            content_type = "html" if html else "plain"
-            msg = MIMEText(body, content_type, "utf-8")
+        msg = self._build_message_body(body, html, attachments, inline_images)
 
         # Handle subject with special characters
         if any(ord(c) > 127 for c in subject):
@@ -1195,9 +1278,21 @@ class EmailClient:
         in_reply_to: str | None = None,
         references: str | None = None,
         reply_to: str | None = None,
+        inline_images: list[dict[str, str]] | None = None,
     ) -> MIMEText | MIMEMultipart:
         msg = self.compose_message(
-            recipients, subject, body, cc, bcc, html, attachments, in_reply_to, references, False, reply_to
+            recipients,
+            subject,
+            body,
+            cc,
+            bcc,
+            html,
+            attachments,
+            in_reply_to,
+            references,
+            False,
+            reply_to,
+            inline_images=inline_images,
         )
 
         async with aiosmtplib.SMTP(
@@ -1629,12 +1724,23 @@ class ClassicEmailHandler(EmailHandler):
         in_reply_to: str | None = None,
         references: str | None = None,
         reply_to: str | None = None,
+        inline_images: list[dict[str, str]] | None = None,
     ) -> None:
         if self.outgoing_client is None:
             raise RuntimeError(f"SMTP is not configured for account '{self.email_settings.account_name}'")
 
         msg = await self.outgoing_client.send_email(
-            recipients, subject, body, cc, bcc, html, attachments, in_reply_to, references, reply_to
+            recipients,
+            subject,
+            body,
+            cc,
+            bcc,
+            html,
+            attachments,
+            in_reply_to,
+            references,
+            reply_to,
+            inline_images=inline_images,
         )
 
         # Save to Sent folder if enabled
@@ -1666,6 +1772,7 @@ class ClassicEmailHandler(EmailHandler):
         in_reply_to: str | None = None,
         references: str | None = None,
         flags: list[str] | None = None,
+        inline_images: list[dict[str, str]] | None = None,
     ) -> str:
         """Compose and save an email to the specified IMAP mailbox.
 
@@ -1694,6 +1801,7 @@ class ClassicEmailHandler(EmailHandler):
             in_reply_to,
             references,
             include_bcc_header=True,
+            inline_images=inline_images,
         )
 
         flags_str = r"(\Draft \Seen)" if flags is None else _validate_flags(flags)

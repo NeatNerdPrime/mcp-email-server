@@ -311,6 +311,23 @@ await send_email(
 
 The `in_reply_to` parameter sets the `In-Reply-To` header, and `references` sets the `References` header. Both are used by email clients to thread conversations properly.
 
+### Embedding Inline Images
+
+`send_email` and `save_to_mailbox` accept an `inline_images` parameter for HTML bodies that need embedded images (e.g. a logo or screenshot). Each item is a `{"path": ..., "cid": ...}` mapping; reference the image in the HTML body as `<img src="cid:...">`. Only the local file path travels through the tool call — the image bytes are attached as a `Content-ID` referenced MIME part, not inlined as base64 in `body`:
+
+```python
+await send_email(
+    account_name="work",
+    recipients=["someone@example.com"],
+    subject="Weekly report",
+    body='<p>See the chart below:</p><img src="cid:chart">',
+    html=True,
+    inline_images=[{"path": "/absolute/path/to/chart.png", "cid": "chart"}],
+)
+```
+
+`inline_images` requires `html=True`. It can be combined with the existing `attachments` parameter — regular attachments are still delivered as normal attachments alongside the inline images.
+
 ## Development
 
 This project is managed using [uv](https://github.com/ai-zerolab/uv).

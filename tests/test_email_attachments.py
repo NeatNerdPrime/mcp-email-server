@@ -220,6 +220,149 @@ class TestEmailAttachments:
                 assert filename in message_str
 
 
+class TestInlineImages:
+    """Tests for CID-referenced inline images in send_email (WP#1485).
+
+    The MCP tool-call parameter transport, not this repo, is what rejects an
+    oversized base64-embedded HTML body (see doc/FIX-mcp-email-body-size.md).
+    These tests cover the ``inline_images`` escape hatch: only a local file
+    path travels through the tool call, and the base64 bytes are attached as
+    a Content-ID referenced MIME part instead of living in ``body`` text.
+    """
+
+    @pytest.mark.asyncio
+    async def test_inline_image_alone_produces_related_structure(self, email_client, tmp_path):
+        """inline_images alone produces a multipart/related message with a
+        Content-ID part matching the given cid and Content-Disposition: inline."""
+        image_file = tmp_path / "logo.png"
+        image_file.write_bytes(b"\x89PNG\r\n\x1a\n_fake_png_bytes_")
+
+        mock_smtp = AsyncMock()
+        mock_smtp.__aenter__ = AsyncMock(return_value=mock_smtp)
+        mock_smtp.__aexit__ = AsyncMock()
+
+        with patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=mock_smtp):
+            await email_client.send_email(
+                recipients=["recipient@example.com"],
+                subject="Inline image test",
+                body='<p>See logo: <img src="cid:logo"></p>',
+                html=True,
+                inline_images=[{"path": str(image_file), "cid": "logo"}],
+            )
+
+        mock_smtp.send_message.assert_called_once()
+        message = mock_smtp.send_message.call_args[0][0]
+        assert message.get_content_type() == "multipart/related"
+
+        parts = list(message.walk())
+        html_parts = [p for p in parts if p.get_content_type() == "text/html"]
+        assert len(html_parts) == 1
+        assert "cid:logo" in html_parts[0].get_payload(decode=True).decode("utf-8")
+
+        image_parts = [p for p in parts if p.get_content_type() == "image/png"]
+        assert len(image_parts) == 1
+        assert image_parts[0]["Content-ID"] == "<logo>"
+        assert image_parts[0].get_content_disposition() == "inline"
+        assert image_parts[0].get_filename() == "logo.png"
+
+    @pytest.mark.asyncio
+    async def test_inline_image_with_attachments_nests_related_inside_mixed(self, email_client, tmp_path):
+        """inline_images + attachments together produce multipart/mixed >
+        multipart/related, with regular attachments as Content-Disposition:
+        attachment siblings of the related part."""
+        image_file = tmp_path / "logo.png"
+        image_file.write_bytes(b"\x89PNG\r\n\x1a\n_fake_png_bytes_")
+        doc_file = tmp_path / "report.pdf"
+        doc_file.write_bytes(b"%PDF-1.4 fake pdf bytes")
+
+        mock_smtp = AsyncMock()
+        mock_smtp.__aenter__ = AsyncMock(return_value=mock_smtp)
+        mock_smtp.__aexit__ = AsyncMock()
+
+        with patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=mock_smtp):
+            await email_client.send_email(
+                recipients=["recipient@example.com"],
+                subject="Inline image plus attachment",
+                body='<p>See logo: <img src="cid:logo"></p>',
+                html=True,
+                inline_images=[{"path": str(image_file), "cid": "logo"}],
+                attachments=[str(doc_file)],
+            )
+
+        message = mock_smtp.send_message.call_args[0][0]
+        assert message.get_content_type() == "multipart/mixed"
+
+        top_level_children = list(message.get_payload())
+        assert len(top_level_children) == 2
+
+        related_part, attachment_part = top_level_children
+        assert related_part.get_content_type() == "multipart/related"
+        assert attachment_part.get_content_disposition() == "attachment"
+        assert attachment_part.get_filename() == "report.pdf"
+
+        related_children = list(related_part.get_payload())
+        image_children = [p for p in related_children if p.get_content_type() == "image/png"]
+        assert len(image_children) == 1
+        assert image_children[0]["Content-ID"] == "<logo>"
+        assert image_children[0].get_content_disposition() == "inline"
+
+    @pytest.mark.asyncio
+    async def test_inline_images_with_html_false_raises_value_error(self, email_client, tmp_path):
+        """CID references only make sense inside an HTML body."""
+        image_file = tmp_path / "logo.png"
+        image_file.write_bytes(b"\x89PNG\r\n\x1a\n_fake_png_bytes_")
+
+        mock_smtp = AsyncMock()
+        mock_smtp.__aenter__ = AsyncMock(return_value=mock_smtp)
+        mock_smtp.__aexit__ = AsyncMock()
+
+        with patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=mock_smtp):
+            with pytest.raises(ValueError, match="inline_images requires html=True"):
+                await email_client.send_email(
+                    recipients=["recipient@example.com"],
+                    subject="Plain text with inline_images",
+                    body="cid:logo won't render here",
+                    html=False,
+                    inline_images=[{"path": str(image_file), "cid": "logo"}],
+                )
+
+    @pytest.mark.asyncio
+    async def test_inline_image_missing_file_raises_file_not_found(self, email_client):
+        """A missing inline-image path reuses _validate_attachment's FileNotFoundError."""
+        mock_smtp = AsyncMock()
+        mock_smtp.__aenter__ = AsyncMock(return_value=mock_smtp)
+        mock_smtp.__aexit__ = AsyncMock()
+
+        with patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=mock_smtp):
+            with pytest.raises(FileNotFoundError, match="Attachment file not found"):
+                await email_client.send_email(
+                    recipients=["recipient@example.com"],
+                    subject="Missing inline image",
+                    body='<img src="cid:logo">',
+                    html=True,
+                    inline_images=[{"path": "/nonexistent/logo.png", "cid": "logo"}],
+                )
+
+    @pytest.mark.asyncio
+    async def test_send_email_without_inline_images_or_attachments_is_unchanged(self, email_client):
+        """Regression: a plain send (no attachments, no inline_images) still
+        produces a bare MIMEText, matching pre-change behaviour."""
+        mock_smtp = AsyncMock()
+        mock_smtp.__aenter__ = AsyncMock(return_value=mock_smtp)
+        mock_smtp.__aexit__ = AsyncMock()
+
+        with patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=mock_smtp):
+            await email_client.send_email(
+                recipients=["recipient@example.com"],
+                subject="Plain email",
+                body="Simple email, no inline images",
+            )
+
+        message = mock_smtp.send_message.call_args[0][0]
+        assert not message.is_multipart()
+        assert message.get_content_type() == "text/plain"
+
+
 class TestDownloadAttachmentMailboxParam:
     """Tests for download_attachment mailbox parameter."""
 
